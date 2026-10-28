@@ -90,6 +90,9 @@ pub struct Config {
     /// Default deadline for all content fetches of one search; pages that miss
     /// it come back without `content`.
     pub content_timeout: Duration,
+    /// Extractions allowed to wait per core before new pages are skipped as
+    /// "server busy" (bounded latency under CPU overload).
+    pub content_parse_queue_per_core: usize,
     /// Size cap for PDF result pages (they can't be parsed from a partial file).
     pub content_max_pdf_bytes: usize,
     /// Memory budget for extracted page text, shared across searches.
@@ -154,6 +157,7 @@ impl Default for Config {
             content_max_results: 10,
             content_timeout: Duration::from_secs(5),
             content_max_pdf_bytes: 10 * 1024 * 1024,
+            content_parse_queue_per_core: 8,
             content_cache_max_bytes: 64 * 1024 * 1024,
             content_allow_private_ips: false,
             browser: BrowserSettings {
@@ -312,6 +316,7 @@ impl Config {
             content_max_concurrency: parse("CONTENT_MAX_CONCURRENCY", d.content_max_concurrency)?,
             content_max_results: parse("CONTENT_MAX_RESULTS", d.content_max_results)?,
             content_timeout: parse_secs("CONTENT_TIMEOUT_SECS", d.content_timeout)?,
+            content_parse_queue_per_core: parse("CONTENT_PARSE_QUEUE_PER_CORE", d.content_parse_queue_per_core)?,
             content_max_pdf_bytes: parse::<usize>("CONTENT_MAX_PDF_MB", d.content_max_pdf_bytes / (1024 * 1024))?
                 * 1024
                 * 1024,

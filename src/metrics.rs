@@ -28,6 +28,7 @@ pub struct Metrics {
     pub search_failures: AtomicU64,
     pub content_fetches: AtomicU64,
     pub content_timeouts: AtomicU64,
+    pub content_shed: AtomicU64,
     pub hedged: AtomicU64,
     upstream_http: PerEngine,
     upstream_browser: PerEngine,
@@ -54,7 +55,7 @@ impl Metrics {
     }
 
     pub fn render(&self, cache_entries: u64, cache_bytes: u64) -> String {
-        let scalars: [(&str, &str, &str, u64); 11] = [
+        let scalars: [(&str, &str, &str, u64); 12] = [
             (
                 "aws_requests_total",
                 "counter",
@@ -102,6 +103,12 @@ impl Metrics {
                 "counter",
                 "Result pages whose content missed the request's content deadline.",
                 self.content_timeouts.load(Relaxed),
+            ),
+            (
+                "aws_content_shed_total",
+                "counter",
+                "Result pages skipped because content extraction was at capacity.",
+                self.content_shed.load(Relaxed),
             ),
             (
                 "aws_hedged_total",

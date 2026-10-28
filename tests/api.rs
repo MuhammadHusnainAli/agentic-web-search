@@ -1061,3 +1061,33 @@ async fn slow_extras_never_delay_results() {
             .any(|w| w.as_str().unwrap().contains("answer unavailable"))
     );
 }
+
+#[tokio::test]
+async fn content_is_shed_not_queued_when_extraction_is_saturated() {
+    let mock = MockServer::start().await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "busy", 1, 2)))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/doc/1/1"))
+        .respond_with(html("<p>never fetched</p>"))
+        .expect(0) // shed before downloading
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.content_parse_queue_per_core = 0;
+    let app = app(cfg);
+    let r = call(
+        &app,
+        post(json!({"query": "busy", "engine": "mojeek", "include_content": true, "content_limit": 1})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(
+        r.json["results"][0]["content_error"]
+            .as_str()
+            .unwrap()
+            .contains("server busy")
+    );
+    assert_eq!(r.json["results"].as_array().unwrap().len(), 2, "results still returned");
+}

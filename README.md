@@ -239,6 +239,19 @@ The ones that matter most:
   | one engine + content of top 3 | ~2,650 req/s | 95 ms | 108 ms |
   | first engine stalls 2 s: no hedging / default / `HEDGE_DELAY_MS=300` / `race` | – | 2003 / 1254 / 354 / 65 ms | – |
 
+  Open-loop at 100k requests/minute, with every query unique, the same mock and 0 errors:
+
+  | Workload per request | Cores | p50 | p99 | CPU used | Content skipped |
+  |---|---|---|---|---|---|
+  | snippets only | 2 | 52 ms | 55 ms | 0.3 | – |
+  | Markdown content + metadata, top 3 | 2 | 86 ms | 89 ms | 1.8 | 2.7% |
+  | Markdown content + metadata, top 3 | 4 | 85 ms | 87 ms | 1.8 | 0% |
+  | merge 5 engines + relevant content ×3 + suggestions + answer | 4 | 89 ms | 116 ms | 3.75 | 0.4% |
+
+  A content page costs about 0.3 ms of CPU: roughly 0.1 ms to parse and extract, the rest to fetch it.
+  When extraction can't keep up, pages are skipped with `content_error: "skipped: server busy"`
+  (`CONTENT_PARSE_QUEUE_PER_CORE`) instead of queueing until the content deadline, so latency stays bounded.
+
   The service adds about 2 ms over upstream latency. Memory is bounded by `CACHE_MAX_MB` +
   `CONTENT_CACHE_MB` plus the in-flight working set. With overload (`MAX_CONCURRENT_REQUESTS`) and rate
   limits hit, excess requests get immediate 503 / 429 responses (p99 < 10 ms).

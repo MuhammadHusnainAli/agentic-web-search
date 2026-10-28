@@ -9,7 +9,7 @@ use std::{
     fmt::Write as _,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -159,6 +159,10 @@ pub struct SearchService {
     /// Caps CPU-bound extraction at the core count: more parse threads than
     /// cores adds no throughput, only per-thread allocator heaps.
     parse_permits: Arc<Semaphore>,
+    /// Extractions waiting for a parse permit. Past `max_parse_queue` the CPU
+    /// is saturated: new pages are skipped instead of queueing to the deadline.
+    parse_queue: AtomicUsize,
+    max_parse_queue: usize,
     metrics: Arc<Metrics>,
     /// Per-engine "HTTP blocked until" timestamp, ms since `epoch`.
     http_blocked_until: [AtomicU64; EngineKind::ALL.len()],
@@ -185,6 +189,7 @@ impl SearchService {
             })
             .expire_after(OutputExpiry { ttl: cfg.cache_ttl })
             .build();
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let content_cache = Cache::builder()
             .max_capacity(cfg.content_cache_max_bytes)
             .weigher(|k: &String, v: &Arc<content::Page>| u32::try_from(k.len() + v.weight()).unwrap_or(u32::MAX))
@@ -198,9 +203,9 @@ impl SearchService {
             content_cache,
             upstream: Semaphore::new(cfg.max_upstream_concurrency),
             content_permits: Semaphore::new(cfg.content_max_concurrency),
-            parse_permits: Arc::new(Semaphore::new(
-                std::thread::available_parallelism().map_or(4, |n| n.get()),
-            )),
+            parse_permits: Arc::new(Semaphore::new(cores)),
+            parse_queue: AtomicUsize::new(0),
+            max_parse_queue: cores * cfg.content_parse_queue_per_core,
             metrics,
             http_blocked_until: Default::default(),
             epoch: Instant::now(),
@@ -790,6 +795,12 @@ impl SearchService {
     async fn page(&self, url: &str) -> Result<Arc<content::Page>, String> {
         self.content_cache
             .try_get_with_by_ref(url, async {
+                // Shed before downloading: a page we can't parse in time is
+                // wasted bandwidth and CPU that the rest of the queue needs.
+                if self.parse_queue.load(Ordering::Relaxed) >= self.max_parse_queue {
+                    Metrics::inc(&self.metrics.content_shed);
+                    return Err(BUSY.to_owned());
+                }
                 let _permit = self.content_permits.acquire().await.expect("semaphore never closed");
                 Metrics::inc(&self.metrics.content_fetches);
                 let doc = self.http.fetch_document(url).await?;
@@ -812,12 +823,14 @@ impl SearchService {
                 let max = self.cfg.content_max_chars;
                 // The permit moves into the blocking task: if this search times
                 // out, the parse still finishes before its core is handed back.
-                let permit = self
-                    .parse_permits
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("semaphore never closed");
+                if self.parse_queue.fetch_add(1, Ordering::Relaxed) >= self.max_parse_queue {
+                    self.parse_queue.fetch_sub(1, Ordering::Relaxed);
+                    Metrics::inc(&self.metrics.content_shed);
+                    return Err(BUSY.to_owned());
+                }
+                let permit = self.parse_permits.clone().acquire_owned().await;
+                self.parse_queue.fetch_sub(1, Ordering::Relaxed);
+                let permit = permit.expect("semaphore never closed");
                 let page = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     if pdf {
@@ -844,6 +857,8 @@ impl SearchService {
 /// Reciprocal-rank fusion of several engines' rankings: a URL scores
 /// `Σ 1/(60 + rank)` over the engines that returned it, so agreement between
 /// engines beats a single high placement. Keeps the longest snippet.
+const BUSY: &str = "skipped: server busy (content extraction at capacity)";
+
 /// Reciprocal-rank-fusion constant: dampens the gap between neighbouring ranks.
 const RRF_K: f64 = 60.0;
 

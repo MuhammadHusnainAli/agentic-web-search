@@ -1,8 +1,9 @@
 //! Fake search engines for load testing the full (cache-miss) pipeline
 //! without hammering real engines.
 //!
-//! Serves SERPs in each engine's real markup, plus result pages for content
-//! extraction. Point the service at it with `ENGINE_<NAME>_URL`.
+//! Serves SERPs in each engine's real markup, result pages for content
+//! extraction, and the suggestion / instant-answer JSON endpoints. Point the
+//! service at it with `ENGINE_<NAME>_URL` and `EXTRAS_BASE_URL`.
 //!
 //! ```sh
 //! MOCK_DELAY_MS=50 MOCK_SLOW=bing MOCK_SLOW_MS=2000 \
@@ -152,13 +153,43 @@ async fn doc(Path((slug, n)): Path<(String, u32)>) -> Html<String> {
     Html(out)
 }
 
+/// OpenSearch-style suggestions (`[query, [suggestion, …]]`), as every engine's
+/// suggestion endpoint returns them. Google, Bing, Brave and DuckDuckGo differ
+/// only in path and query-parameter name.
+async fn suggest(Query(p): Query<HashMap<String, String>>) -> axum::Json<serde_json::Value> {
+    tokio::time::sleep(env_ms("MOCK_EXTRAS_DELAY_MS", 20)).await;
+    let q = p.get("q").or_else(|| p.get("query")).cloned().unwrap_or_default();
+    let list: Vec<String> = ["tutorial", "examples", "vs go", "book"]
+        .iter()
+        .map(|s| format!("{q} {s}"))
+        .collect();
+    axum::Json(serde_json::json!([q, list]))
+}
+
+/// DuckDuckGo Instant Answer shape.
+async fn instant_answer(Query(p): Query<HashMap<String, String>>) -> axum::Json<serde_json::Value> {
+    tokio::time::sleep(env_ms("MOCK_EXTRAS_DELAY_MS", 20)).await;
+    let q = p.get("q").cloned().unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "Heading": q, "AbstractText": format!("{q} is a topic with a short encyclopedia summary."),
+        "AbstractSource": "Wikipedia", "AbstractURL": format!("https://en.wikipedia.org/wiki/{}", q.replace(' ', "_")),
+        "Answer": "", "Definition": ""
+    }))
+}
+
 #[tokio::main]
 async fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9100".into());
     let app = Router::new()
         .route("/search", get(search))
         .route("/html/", post(duckduckgo))
-        .route("/doc/{slug}/{n}", get(doc));
+        .route("/doc/{slug}/{n}", get(doc))
+        // Point EXTRAS_BASE_URL here for suggestions / instant answers.
+        .route("/ac/", get(suggest))
+        .route("/complete/search", get(suggest))
+        .route("/osjson.aspx", get(suggest))
+        .route("/api/suggest", get(suggest))
+        .route("/", get(instant_answer));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     println!("mock upstream on http://{addr}");
     axum::serve(listener, app).await.expect("serve");
