@@ -100,6 +100,8 @@ Build without the browser (smaller binary, no Chromium needed):
 | `content_mode` | string | `full` | `full` (page from the top) or `relevant` (only the passages matching the query, with their headings) |
 | `content_max_chars` | int | `CONTENT_MAX_CHARS` | per-result text cap, cut on a word boundary |
 | `content_timeout_ms` | int | `CONTENT_TIMEOUT_SECS` | content deadline; slower pages get `content_error` instead |
+| `include_suggestions` | bool | false | query suggestions from the engine's own suggestion endpoint |
+| `include_answer` | bool | false | a direct answer: computed answer, summary (usually Wikipedia) or definition |
 | `fresh` | bool | false | bypass the cache (the fresh result is cached) |
 
 GET uses the same fields as query parameters, with lists comma-separated:
@@ -124,6 +126,23 @@ These come from `<title>`, meta/OpenGraph tags, JSON-LD, `<time>` and `<html lan
 and `published` from the PDF's Info dictionary. PDFs larger than `CONTENT_MAX_PDF_MB` (10) get a `content_error`.
 Big PDFs on slow hosts may need a longer `content_timeout_ms` (up to 30,000).
 The response also lists `engines_used`, and adds `warnings` when an engine can't apply a filter.
+
+Page-level extras:
+
+```json
+"correction": "rust programming language",
+"suggestions": ["eiffel tower height", "eiffel tower tickets"],
+"answer": {"kind": "abstract", "heading": "Eiffel Tower", "text": "The Eiffel Tower is a lattice tower…",
+           "source": "Wikipedia", "url": "https://en.wikipedia.org/wiki/Eiffel_Tower"}
+```
+
+- `correction` is the engine's "did you mean" query. It comes free with the SERP (DuckDuckGo shows it in HTML;
+  Bing and Brave render theirs with JavaScript only).
+- `suggestions` and `answer` come from the engines' keyless JSON endpoints, the ones their own search boxes call.
+  Google, Bing, Brave and DuckDuckGo serve suggestions; DuckDuckGo stands in for Yahoo and Mojeek.
+  Answers come from DuckDuckGo's Instant Answer endpoint.
+- Both extras run alongside the search, with a deadline of `EXTRAS_TIMEOUT_MS` (2000). A slow or failing extra
+  never fails the search; it adds a `warnings` entry instead.
 
 ### Latency
 

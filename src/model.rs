@@ -287,6 +287,30 @@ pub struct PageMetadata {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnswerKind {
+    /// A computed answer (calculations, conversions, …).
+    Answer,
+    /// A short summary of the topic, usually from Wikipedia.
+    Abstract,
+    /// A dictionary definition.
+    Definition,
+}
+
+/// A direct answer to the query (only with `include_answer`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Answer {
+    pub kind: AnswerKind,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// A normalised, ranked search result returned to callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchResult {

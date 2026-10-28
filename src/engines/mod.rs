@@ -91,6 +91,23 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Extract organic results (ads and widgets excluded).
     fn parse(&self, html: &str) -> Vec<RawResult>;
+
+    /// Results plus page-level extras. Engines that surface a spelling
+    /// correction in their HTML override this to parse the page only once.
+    fn parse_serp(&self, html: &str) -> Serp {
+        Serp {
+            results: self.parse(html),
+            correction: None,
+        }
+    }
+}
+
+/// What one SERP page yields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Serp {
+    pub results: Vec<RawResult>,
+    /// The engine's "did you mean" / "including results for" query.
+    pub correction: Option<String>,
 }
 
 /// Fixed-size registry indexed by [`EngineKind::index`].

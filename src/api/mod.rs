@@ -141,6 +141,9 @@ async fn run_search(state: SharedState, params: SearchParams) -> Result<Response
         elapsed_ms: started.elapsed().as_millis() as u64,
         results: &out.results,
         errors: &out.errors,
+        correction: out.correction.as_deref(),
+        suggestions: &out.suggestions,
+        answer: out.answer.as_ref(),
         warnings: &out.warnings,
     };
     let mut resp = Json(body).into_response();

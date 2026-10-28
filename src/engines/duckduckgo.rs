@@ -4,7 +4,7 @@ use scraper::{Html, Selector};
 use url::Url;
 
 use super::{
-    Engine, PageQuery, UpstreamRequest,
+    Engine, PageQuery, Serp, UpstreamRequest,
     util::{absolute_http, contains_any_ci, first_text, generic_block, sel, text},
 };
 use crate::model::{EngineKind, RawResult, SafeSearch};
@@ -19,6 +19,9 @@ struct Sel {
     js_link: Selector,
     js_snippet: [Selector; 1],
 }
+
+/// "Including results for <a>corrected query</a>" on the no-JS SERP.
+static CORRECTION: LazyLock<Selector> = LazyLock::new(|| sel("#did_you_mean a"));
 
 static S: LazyLock<Sel> = LazyLock::new(|| Sel {
     item: sel("div.result:not(.result--ad)"),
@@ -117,7 +120,20 @@ impl Engine for DuckDuckGo {
     }
 
     fn parse(&self, html: &str) -> Vec<RawResult> {
+        self.results(&Html::parse_document(html))
+    }
+
+    fn parse_serp(&self, html: &str) -> Serp {
         let doc = Html::parse_document(html);
+        Serp {
+            results: self.results(&doc),
+            correction: doc.select(&CORRECTION).next().map(text).filter(|t| !t.is_empty()),
+        }
+    }
+}
+
+impl DuckDuckGo {
+    fn results(&self, doc: &Html) -> Vec<RawResult> {
         let s = &*S;
         let mut out: Vec<RawResult> = doc
             .select(&s.item)
@@ -131,9 +147,7 @@ impl Engine for DuckDuckGo {
         }
         out
     }
-}
 
-impl DuckDuckGo {
     fn extract(&self, item: scraper::ElementRef<'_>, link: &Selector, snippet: &[Selector]) -> Option<RawResult> {
         let a = item.select(link).next()?;
         let url = unwrap_link(absolute_http(a.value().attr("href")?, &self.base)?)?;

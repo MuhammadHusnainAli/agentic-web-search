@@ -239,6 +239,20 @@ impl HttpFetcher {
         read_capped(resp, self.max_body).await.map_err(map_err)
     }
 
+    /// GET a small JSON document from an engine endpoint (suggestions, answers).
+    pub async fn fetch_json(&self, engine: EngineKind, url: Url) -> Result<String, UpstreamError> {
+        let fetched = self
+            .fetch_serp(engine, &UpstreamRequest::get(url).header("accept", "application/json"))
+            .await?;
+        if fetched.status >= 400 {
+            return Err(UpstreamError::Status {
+                engine,
+                status: fetched.status,
+            });
+        }
+        Ok(fetched.body)
+    }
+
     /// Fetch an arbitrary result page for content extraction (SSRF-guarded).
     /// PDFs get a larger size cap: they can't be parsed from a partial file.
     pub async fn fetch_document(&self, url: &str) -> Result<Document, String> {

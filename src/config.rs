@@ -74,6 +74,11 @@ pub struct Config {
     /// Per-engine base URL overrides, e.g. for mirrors or tests.
     pub engine_base_urls: HashMap<EngineKind, String>,
 
+    /// Host override for the suggestion / instant-answer endpoints (tests, mirrors).
+    pub extras_base_url: Option<String>,
+    /// Deadline for suggestions and answers; they never delay results longer.
+    pub extras_timeout: Duration,
+
     // --- caching ---
     pub cache_ttl: Duration,
     pub cache_max_bytes: u64,
@@ -140,6 +145,8 @@ impl Default for Config {
             proxy_url: None,
             user_agents: DEFAULT_USER_AGENTS.iter().map(|s| s.to_string()).collect(),
             engine_base_urls: HashMap::new(),
+            extras_base_url: None,
+            extras_timeout: Duration::from_millis(2000),
             cache_ttl: Duration::from_secs(900),
             cache_max_bytes: 256 * 1024 * 1024,
             content_max_chars: 8_000,
@@ -291,6 +298,14 @@ impl Config {
             proxy_url: var("PROXY_URL"),
             user_agents: csv("USER_AGENTS").unwrap_or(d.user_agents),
             engine_base_urls,
+            extras_base_url: match var("EXTRAS_BASE_URL") {
+                Some(v) => {
+                    url::Url::parse(&v).map_err(|e| ConfigError(format!("EXTRAS_BASE_URL={v}: {e}")))?;
+                    Some(v)
+                }
+                None => None,
+            },
+            extras_timeout: Duration::from_millis(parse("EXTRAS_TIMEOUT_MS", d.extras_timeout.as_millis() as u64)?),
             cache_ttl: parse_secs("CACHE_TTL_SECS", d.cache_ttl)?,
             cache_max_bytes: parse::<u64>("CACHE_MAX_MB", d.cache_max_bytes / (1024 * 1024))? * 1024 * 1024,
             content_max_chars: parse("CONTENT_MAX_CHARS", d.content_max_chars)?,

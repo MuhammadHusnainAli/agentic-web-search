@@ -2,6 +2,7 @@
 //! optional content extraction.
 
 pub mod content;
+pub mod extras;
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -22,13 +23,13 @@ use url::Url;
 
 use crate::{
     config::Config,
-    engines::{Engine, Engines, PageQuery, util::domain_of},
+    engines::{Engine, Engines, PageQuery, Serp, util::domain_of},
     error::{AppError, EngineFailure, UpstreamError},
     fetch::{BrowserPool, HttpFetcher},
     metrics::Metrics,
     model::{
-        ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, PageMetadata, RawResult, Region, SafeSearch,
-        SearchResult, Strategy, TimeRange,
+        Answer, ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, PageMetadata, RawResult, Region,
+        SafeSearch, SearchResult, Strategy, TimeRange,
     },
 };
 
@@ -50,6 +51,8 @@ pub struct SearchRequest {
     pub exclude_domains: Vec<String>,
     pub file_type: Option<String>,
     pub unique_domains: bool,
+    pub include_suggestions: bool,
+    pub include_answer: bool,
     pub max_results: Option<u32>,
     pub include_content: bool,
     pub content_limit: u32,
@@ -102,6 +105,9 @@ pub struct SearchOutput {
     pub total_results: usize,
     pub results: Box<RawValue>,
     pub errors: Vec<EngineFailure>,
+    pub correction: Option<String>,
+    pub suggestions: Vec<String>,
+    pub answer: Option<Answer>,
     pub warnings: Vec<String>,
     #[serde(skip)]
     partial: bool,
@@ -127,6 +133,7 @@ struct EngineRun {
     pages_fetched: u32,
     results: Vec<SearchResult>,
     failures: Vec<EngineFailure>,
+    correction: Option<String>,
 }
 
 /// Engine runs that produced a SERP, best first, plus everything that didn't.
@@ -252,28 +259,34 @@ impl SearchService {
 
     async fn execute(&self, req: &SearchRequest) -> Result<SearchOutput, AppError> {
         let query = req.upstream_query();
+        let search = async {
+            Ok::<_, AppError>(match req.engine {
+                EngineChoice::Engine(kind) => {
+                    let run = self.run_engine(kind, req, &query).await;
+                    if run.pages_fetched == 0 {
+                        return Err(all_failed(run.failures));
+                    }
+                    Outcome {
+                        runs: vec![run],
+                        tried: vec![kind],
+                        failures: Vec::new(),
+                    }
+                }
+                EngineChoice::Auto => match req.strategy {
+                    Strategy::Fallback => self.run_hedged(req, &query, self.cfg.hedge_delay).await?,
+                    Strategy::Race => self.run_hedged(req, &query, Duration::ZERO).await?,
+                    Strategy::Merge => self.run_merge(req, &query).await?,
+                },
+            })
+        };
+        // Suggestions / answers run alongside the search, under their own deadline.
+        let (outcome, (suggestions, answer, mut warnings)) = tokio::join!(search, self.extras(req));
         let Outcome {
             mut runs,
             tried,
             mut failures,
-        } = match req.engine {
-            EngineChoice::Engine(kind) => {
-                let run = self.run_engine(kind, req, &query).await;
-                if run.pages_fetched == 0 {
-                    return Err(all_failed(run.failures));
-                }
-                Outcome {
-                    runs: vec![run],
-                    tried: vec![kind],
-                    failures: Vec::new(),
-                }
-            }
-            EngineChoice::Auto => match req.strategy {
-                Strategy::Fallback => self.run_hedged(req, &query, self.cfg.hedge_delay).await?,
-                Strategy::Race => self.run_hedged(req, &query, Duration::ZERO).await?,
-                Strategy::Merge => self.run_merge(req, &query).await?,
-            },
-        };
+        } = outcome?;
+        let correction = runs.iter().find_map(|r| r.correction.clone());
 
         let engine = runs[0].engine;
         let pages_fetched = runs.iter().map(|r| r.pages_fetched).max().unwrap_or(0);
@@ -309,16 +322,14 @@ impl SearchService {
             self.attach_content(&mut results, req).await;
         }
 
-        let warnings = req
-            .time_range
-            .map(|t| {
+        if let Some(t) = req.time_range {
+            warnings.extend(
                 engines_used
                     .iter()
                     .filter(|k| !self.engines.get(**k).supports_time_range(t))
-                    .map(|k| format!("{k} has no time_range filter; its results are not date-restricted"))
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .map(|k| format!("{k} has no time_range filter; its results are not date-restricted")),
+            );
+        }
 
         let raw = serde_json::value::to_raw_value(&results).map_err(|e| AppError::Internal(e.to_string()))?;
         Ok(SearchOutput {
@@ -330,8 +341,60 @@ impl SearchService {
             results: raw,
             partial,
             errors: failures,
+            correction,
+            suggestions,
+            answer,
             warnings,
         })
+    }
+
+    /// Query suggestions and a direct answer, as requested. Failures only
+    /// produce warnings: extras never fail or delay a search past their deadline.
+    async fn extras(&self, req: &SearchRequest) -> (Vec<String>, Option<Answer>, Vec<String>) {
+        let deadline = tokio::time::Instant::now() + self.cfg.extras_timeout;
+        let base = self.cfg.extras_base_url.as_deref().and_then(|u| Url::parse(u).ok());
+        let fetch = |engine: EngineKind, url: Url| async move {
+            let _permit = self.upstream.acquire().await.expect("semaphore never closed");
+            match tokio::time::timeout_at(deadline, self.http.fetch_json(engine, url)).await {
+                Ok(Ok(body)) => Ok(body),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!("timed out after {} ms", self.cfg.extras_timeout.as_millis())),
+            }
+        };
+        let suggestions = async {
+            if !req.include_suggestions {
+                return Ok(Vec::new());
+            }
+            let engine = match req.engine {
+                EngineChoice::Engine(k) => k,
+                EngineChoice::Auto => self.chain(req).first().copied().unwrap_or(EngineKind::DuckDuckGo),
+            };
+            let source = extras::suggest_engine(engine);
+            let url = extras::suggest_url(source, &req.query, req.region, base.as_ref());
+            fetch(source, url)
+                .await
+                .map(|body| extras::parse_suggestions(&body, &req.query))
+        };
+        let answer = async {
+            if !req.include_answer {
+                return Ok(None);
+            }
+            let url = extras::answer_url(&req.query, req.region, req.safe, base.as_ref());
+            fetch(EngineKind::DuckDuckGo, url)
+                .await
+                .map(|body| extras::parse_answer(&body))
+        };
+        let (suggestions, answer) = tokio::join!(suggestions, answer);
+        let mut warnings = Vec::new();
+        let suggestions = suggestions.unwrap_or_else(|e| {
+            warnings.push(format!("suggestions unavailable: {e}"));
+            Vec::new()
+        });
+        let answer = answer.unwrap_or_else(|e| {
+            warnings.push(format!("answer unavailable: {e}"));
+            None
+        });
+        (suggestions, answer, warnings)
     }
 
     /// Engines `auto` walks, in priority order.
@@ -508,11 +571,13 @@ impl SearchService {
         let mut results = Vec::with_capacity(pages.len() * 10);
         let mut failures = Vec::new();
         let mut pages_fetched = 0;
+        let mut correction = None;
         for (page, outcome) in pages {
             match outcome {
-                Ok(raw) => {
+                Ok(serp) => {
                     pages_fetched += 1;
-                    for r in raw {
+                    correction = correction.or(serp.correction);
+                    for r in serp.results {
                         let domain = domain_of(&r.url);
                         if !req.keeps_domain(&domain) || !seen.insert(dedupe_key(&r.url)) {
                             continue;
@@ -545,15 +610,11 @@ impl SearchService {
             pages_fetched,
             results,
             failures,
+            correction,
         }
     }
 
-    async fn fetch_page(
-        &self,
-        engine: &dyn Engine,
-        q: &PageQuery<'_>,
-        mode: FetchMode,
-    ) -> Result<Vec<RawResult>, UpstreamError> {
+    async fn fetch_page(&self, engine: &dyn Engine, q: &PageQuery<'_>, mode: FetchMode) -> Result<Serp, UpstreamError> {
         let kind = engine.kind();
         let browser = self.browser.is_enabled();
         let browser_first = match mode {
@@ -578,7 +639,7 @@ impl SearchService {
         Ok(results)
     }
 
-    async fn fetch_http(&self, engine: &dyn Engine, q: &PageQuery<'_>) -> Result<Vec<RawResult>, UpstreamError> {
+    async fn fetch_http(&self, engine: &dyn Engine, q: &PageQuery<'_>) -> Result<Serp, UpstreamError> {
         let kind = engine.kind();
         let req = engine.http_request(q);
         let fetched = {
@@ -599,15 +660,15 @@ impl SearchService {
                 status: fetched.status,
             });
         }
-        let results = engine.parse(&fetched.body);
-        if looks_poisoned(q.query, &results) {
+        let serp = engine.parse_serp(&fetched.body);
+        if serp.looks_poisoned(q.query) {
             self.mark_blocked(kind);
             return Err(UpstreamError::Blocked(kind));
         }
-        Ok(results)
+        Ok(serp)
     }
 
-    async fn fetch_browser(&self, engine: &dyn Engine, q: &PageQuery<'_>) -> Result<Vec<RawResult>, UpstreamError> {
+    async fn fetch_browser(&self, engine: &dyn Engine, q: &PageQuery<'_>) -> Result<Serp, UpstreamError> {
         let kind = engine.kind();
         if !self.browser.is_enabled() {
             return Err(UpstreamError::BrowserUnavailable(
@@ -637,12 +698,12 @@ impl SearchService {
             self.metrics.upstream_blocked(kind);
             return Err(UpstreamError::Blocked(kind));
         }
-        let results = engine.parse(&html);
-        if looks_poisoned(q.query, &results) {
+        let serp = engine.parse_serp(&html);
+        if serp.looks_poisoned(q.query) {
             self.metrics.upstream_blocked(kind);
             return Err(UpstreamError::Blocked(kind));
         }
-        Ok(results)
+        Ok(serp)
     }
 
     fn now_ms(&self) -> u64 {
@@ -815,6 +876,18 @@ pub(crate) const STOPWORDS: &[&str] = &[
     "from", "that", "this", "your", "into", "about", "was", "were", "has", "have", "not",
 ];
 
+impl Serp {
+    /// [`looks_poisoned`], also accepting results that match the engine's own
+    /// correction of the query.
+    fn looks_poisoned(&self, query: &str) -> bool {
+        looks_poisoned(query, &self.results)
+            && self
+                .correction
+                .as_deref()
+                .is_none_or(|c| looks_poisoned(c, &self.results))
+    }
+}
+
 /// Soft-block detection. Some engines (notably Bing) answer suspected bots with
 /// a normal-looking SERP of unrelated popular pages that at best echo a single
 /// query word. A page is treated as poisoned when no result mentions at least
@@ -850,14 +923,33 @@ fn looks_poisoned(query: &str, results: &[RawResult]) -> bool {
 
 /// ASCII terms must match a whole word (or its plural) so "web" doesn't match
 /// "webster"; other scripts (often written without spaces) match as substrings.
+/// Terms of 5+ letters also match a word one typo away, since engines answer
+/// misspelled queries ("programing langauge") with correctly spelled results.
 fn term_matches(term: &str, hay: &str, words: &HashSet<&str>) -> bool {
     if !term.is_ascii() {
         return hay.contains(term);
     }
     words.contains(term)
-        || words
-            .iter()
-            .any(|w| w.strip_prefix(term).is_some_and(|rest| rest == "s" || rest == "es"))
+        || words.iter().any(|w| {
+            w.strip_prefix(term).is_some_and(|rest| rest == "s" || rest == "es")
+                || (term.len() >= 5 && w.is_ascii() && one_typo_apart(term.as_bytes(), w.as_bytes()))
+        })
+}
+
+/// Optimal-string-alignment distance ≤ 1: one insertion, deletion,
+/// substitution or adjacent transposition.
+fn one_typo_apart(a: &[u8], b: &[u8]) -> bool {
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    match (a.len(), b.len()) {
+        (0, 0) => true,
+        (x, y) if x == y => a[1..] == b[1..] || (x >= 2 && a[0] == b[1] && a[1] == b[0] && a[2..] == b[2..]),
+        (x, y) if x > y => a[1..] == *b,
+        _ => *a == b[1..],
+    }
 }
 
 fn is_textual(content_type: Option<&str>) -> bool {
@@ -957,6 +1049,8 @@ mod tests {
             exclude_domains: Vec::new(),
             file_type: None,
             unique_domains: false,
+            include_suggestions: false,
+            include_answer: false,
             max_results: None,
             include_content: false,
             content_limit: 0,
@@ -1016,6 +1110,7 @@ mod tests {
             pages_fetched: 1,
             results: urls.iter().map(|(u, s)| res(engine, u, s)).collect(),
             failures: Vec::new(),
+            correction: None,
         };
         let mut runs = [
             run(EngineKind::Bing, &[("https://a.com/", "a"), ("https://b.com/", "b")]),
@@ -1030,6 +1125,41 @@ mod tests {
         assert_eq!(fused[0].engines, [EngineKind::Bing, EngineKind::Brave]);
         assert_eq!(fused[0].snippet, "longer b snippet");
         assert_eq!(fused[1].engines, [EngineKind::Bing]);
+    }
+
+    #[test]
+    fn misspelled_queries_are_not_soft_blocks() {
+        let r = |t: &str| RawResult {
+            title: t.into(),
+            url: "https://example.com/".into(),
+            snippet: String::new(),
+        };
+        let real = [
+            r("The Rust Programming Language"),
+            r("Rust (programming language)"),
+            r("x"),
+        ];
+        assert!(!looks_poisoned("rust programing langauge", &real));
+        // Still catches junk, and short words don't get fuzzy matches.
+        assert!(looks_poisoned(
+            "rust programing langauge",
+            &[r("Facebook"), r("Rusty nails"), r("x")]
+        ));
+        assert!(looks_poisoned(
+            "best rust web framework",
+            &[r("Best Buy"), r("Best Western"), r("we")]
+        ));
+        assert!(one_typo_apart(b"langauge", b"language"));
+        assert!(one_typo_apart(b"programing", b"programming"));
+        assert!(one_typo_apart(b"tokio", b"tokyo"));
+        assert!(!one_typo_apart(b"tokio", b"token"));
+        assert!(!one_typo_apart(b"abcde", b"abcdefg"));
+
+        let serp = Serp {
+            results: vec![r("Kubernetes operators explained"), r("x"), r("y")],
+            correction: Some("kubernetes operators".into()),
+        };
+        assert!(!serp.looks_poisoned("kubernets operatrs"));
     }
 
     #[test]

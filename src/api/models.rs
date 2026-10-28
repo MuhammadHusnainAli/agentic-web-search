@@ -9,7 +9,10 @@ use url::Url;
 use crate::{
     config::Config,
     error::{AppError, EngineFailure},
-    model::{ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, Region, SafeSearch, Strategy, TimeRange},
+    model::{
+        Answer, ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, Region, SafeSearch, Strategy,
+        TimeRange,
+    },
     search::SearchRequest,
 };
 
@@ -62,6 +65,10 @@ pub struct SearchParams {
     pub content_max_chars: Option<u32>,
     /// Deadline for content extraction; slower pages come back without `content`.
     pub content_timeout_ms: Option<u32>,
+    /// Add query suggestions from the engine's suggestion endpoint.
+    pub include_suggestions: Option<bool>,
+    /// Add a direct answer (computed answer, summary or definition) when one exists.
+    pub include_answer: Option<bool>,
     /// Bypass the cache for this request (the fresh result is still cached).
     pub fresh: Option<bool>,
 }
@@ -245,6 +252,8 @@ impl SearchParams {
             exclude_domains,
             file_type,
             unique_domains: self.unique_domains.unwrap_or(false),
+            include_suggestions: self.include_suggestions.unwrap_or(false),
+            include_answer: self.include_answer.unwrap_or(false),
             max_results: self.max_results,
             include_content,
             // Normalise so content knobs don't fragment the cache when content is off.
@@ -279,6 +288,13 @@ pub struct SearchResponse<'a> {
     pub elapsed_ms: u64,
     pub results: &'a RawValue,
     pub errors: &'a [EngineFailure],
+    /// The engine's "did you mean" query, when it offered one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub suggestions: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<&'a Answer>,
     /// Non-fatal notes, e.g. an engine that ignored `time_range`.
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     pub warnings: &'a [String],
@@ -319,6 +335,8 @@ mod tests {
             content_mode: None,
             content_max_chars: None,
             content_timeout_ms: None,
+            include_suggestions: None,
+            include_answer: None,
             fresh: None,
         }
     }

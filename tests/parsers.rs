@@ -173,3 +173,15 @@ fn time_range_maps_to_each_engines_native_filter() {
     );
     assert!(!engines.get(EngineKind::Mojeek).supports_time_range(TimeRange::Day));
 }
+
+#[test]
+fn duckduckgo_reports_spelling_corrections() {
+    // Captured live for the query "rust programing langauge".
+    let engines = Engines::new(&Config::default());
+    let ddg = engines.get(EngineKind::DuckDuckGo);
+    let serp = ddg.parse_serp(&fixture("duckduckgo_spelling.html"));
+    assert_eq!(serp.correction.as_deref(), Some("rust programming language"));
+    assert!(serp.results.len() >= 5, "{}", serp.results.len());
+    assert_eq!(serp.results, ddg.parse(&fixture("duckduckgo_spelling.html")));
+    assert!(ddg.parse_serp(&fixture("duckduckgo.html")).correction.is_none());
+}

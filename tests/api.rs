@@ -947,3 +947,104 @@ async fn pdf_results_get_text_content() {
     );
     assert_eq!(res[2]["content_error"], "PDF larger than 1 MiB");
 }
+
+#[tokio::test]
+async fn suggestions_answers_and_corrections() {
+    let mock = MockServer::start().await;
+    // DDG SERP with a spelling correction (real captured page).
+    Mock::given(method("POST"))
+        .and(path("/html/"))
+        .respond_with(html(fixture("duckduckgo_spelling.html")))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/ac/"))
+        .and(query_param("q", "rust programing langauge"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"["rust programing langauge",["rust programming language","rust programming language book"]]"#,
+            "application/json",
+        ))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/"))
+        .and(query_param("format", "json"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"Heading":"Rust (programming language)","AbstractText":"Rust is a general-purpose programming language.",
+               "AbstractSource":"Wikipedia","AbstractURL":"https://en.wikipedia.org/wiki/Rust_(programming_language)"}"#,
+            "application/json",
+        ))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.extras_base_url = Some(format!("{}/", mock.uri()));
+    let app = app(cfg);
+
+    let r = call(
+        &app,
+        post(json!({"query": "rust programing langauge", "engine": "ddg",
+                    "include_suggestions": true, "include_answer": true})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["correction"], "rust programming language");
+    assert_eq!(
+        r.json["suggestions"],
+        json!(["rust programming language", "rust programming language book"])
+    );
+    assert_eq!(r.json["answer"]["kind"], "abstract");
+    assert_eq!(r.json["answer"]["source"], "Wikipedia");
+    assert!(r.json.get("warnings").is_none(), "{}", r.json);
+
+    // Off by default: no extra requests, no fields (correction is free, from the SERP).
+    let r = call(
+        &app,
+        post(json!({"query": "rust programing langauge", "engine": "ddg"})),
+    )
+    .await;
+    assert!(r.json.get("suggestions").is_none() && r.json.get("answer").is_none());
+    assert_eq!(r.json["correction"], "rust programming language");
+}
+
+#[tokio::test]
+async fn slow_extras_never_delay_results() {
+    let mock = MockServer::start().await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "slow extras", 1, 2)))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/ac/"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.extras_base_url = Some(format!("{}/", mock.uri()));
+    cfg.extras_timeout = Duration::from_millis(200);
+    let app = app(cfg);
+    let started = std::time::Instant::now();
+    let r = call(
+        &app,
+        get("/v1/search?q=slow+extras&engine=mojeek&include_suggestions=true&include_answer=true"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(r.json["results"].as_array().unwrap().len(), 2);
+    let warnings = r.json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("suggestions unavailable: timed out"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("answer unavailable"))
+    );
+}
