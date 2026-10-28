@@ -157,6 +157,17 @@ pub enum ContentFormat {
     Text,
 }
 
+/// How much of a page goes into `content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentMode {
+    /// The page from the top, up to the character budget.
+    #[default]
+    Full,
+    /// Only the passages that best match the query (plus their headings).
+    Relevant,
+}
+
 /// How `engine=auto` combines engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

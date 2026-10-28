@@ -4,12 +4,13 @@
 //! items, code, quotes, table rows). That is what gets cached; each request then
 //! renders it as plain text or Markdown within its own character budget.
 
-use std::{borrow::Cow, sync::LazyLock};
+use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 
 use ego_tree::{NodeId, iter::Edge};
 use scraper::{Html, Node, Selector};
 use url::Url;
 
+use super::STOPWORDS;
 use crate::{engines::util::sel, model::ContentFormat};
 
 static ROOTS: LazyLock<[Selector; 4]> =
@@ -87,6 +88,70 @@ impl Page {
     /// anything of the page was left out.
     pub fn render(&self, format: ContentFormat, max_chars: usize) -> (String, bool) {
         self.render_blocks(self.blocks.iter(), format, max_chars)
+    }
+
+    /// Render only the blocks that best match `query` (BM25), each with the
+    /// heading it sits under, in page order, gaps marked with `…`. Falls back to
+    /// [`Page::render`] when nothing on the page matches.
+    pub fn render_relevant(&self, query: &str, format: ContentFormat, max_chars: usize) -> (String, bool) {
+        let terms = query_terms(query);
+        let docs: Vec<Vec<String>> = self.blocks.iter().map(|b| tokens(&b.text)).collect();
+        let scores = bm25(&terms, &docs);
+        let mut ranked: Vec<usize> = (0..self.blocks.len()).filter(|&i| scores[i] > 0.0).collect();
+        if ranked.is_empty() {
+            return self.render(format, max_chars);
+        }
+        ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+
+        // Greedily take the best blocks (and their headings) that fit the budget.
+        let cost = |i: usize| self.blocks[i].md.chars().count() + 4;
+        let mut picked = vec![false; self.blocks.len()];
+        let mut used = 0;
+        for i in ranked {
+            let heading = (0..i)
+                .rev()
+                .find(|&j| matches!(self.blocks[j].kind, BlockKind::Heading(_)))
+                .filter(|&j| !picked[j]);
+            let need = cost(i) + heading.map_or(0, cost);
+            if used + need > max_chars {
+                continue;
+            }
+            picked[i] = true;
+            if let Some(h) = heading {
+                picked[h] = true;
+            }
+            used += need;
+        }
+        if !picked.iter().any(|p| *p) {
+            // Even the best passage is over budget: cut it rather than return nothing.
+            let best = scores
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i);
+            return self.render_blocks(std::iter::once(&self.blocks[best]), format, max_chars);
+        }
+
+        let gap = Block {
+            kind: BlockKind::Paragraph,
+            text: "…".into(),
+            md: "…".into(),
+        };
+        let mut chosen = Vec::new();
+        let mut last: Option<usize> = None;
+        for i in (0..self.blocks.len()).filter(|&i| picked[i]) {
+            if last.is_some_and(|l| i > l + 1) || (last.is_none() && i > 0) {
+                chosen.push(&gap);
+            }
+            chosen.push(&self.blocks[i]);
+            last = Some(i);
+        }
+        if last.is_some_and(|l| l + 1 < self.blocks.len()) {
+            chosen.push(&gap);
+        }
+        let (out, _) = self.render_blocks(chosen.into_iter(), format, max_chars);
+        let all = picked.iter().all(|p| *p);
+        (out, self.truncated || !all)
     }
 
     pub(crate) fn render_blocks<'a>(
@@ -175,6 +240,57 @@ fn render_block(format: ContentFormat, b: &Block) -> Cow<'_, str> {
             p => format!("{p}{}", b.md).into(),
         },
     }
+}
+
+/// Lowercased alphanumeric words.
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Distinct, meaningful query words (operators such as `site:x` excluded).
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|w| !w.contains(':') && !w.starts_with('-'))
+        .flat_map(tokens)
+        .filter(|t| t.chars().count() >= 2 && !STOPWORDS.contains(&t.as_str()))
+        .collect();
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
+/// Okapi BM25 score of every doc for `terms` (k1 = 1.2, b = 0.75).
+fn bm25(terms: &[String], docs: &[Vec<String>]) -> Vec<f64> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let n = docs.len() as f64;
+    let avg = (docs.iter().map(Vec::len).sum::<usize>() as f64 / n.max(1.0)).max(1.0);
+    let idf: HashMap<&str, f64> = terms
+        .iter()
+        .map(|t| {
+            let df = docs.iter().filter(|d| d.iter().any(|w| w == t)).count() as f64;
+            (t.as_str(), (1.0 + (n - df + 0.5) / (df + 0.5)).ln())
+        })
+        .collect();
+    docs.iter()
+        .map(|d| {
+            let len = d.len() as f64;
+            terms
+                .iter()
+                .map(|t| {
+                    let tf = d.iter().filter(|w| *w == t).count() as f64;
+                    if tf == 0.0 {
+                        return 0.0;
+                    }
+                    idf[t.as_str()] * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / avg))
+                })
+                .sum()
+        })
+        .collect()
 }
 
 /// At most `max` characters of `text`, cut at a word boundary when possible.
@@ -668,6 +784,36 @@ mod tests {
             "{out:?}"
         );
         assert!(out.chars().count() <= 30);
+    }
+
+    #[test]
+    fn relevant_mode_keeps_matching_passages_with_headings() {
+        let mut html = String::from("<body><h1>Cooking</h1><p>Bread needs flour and water.</p>");
+        for i in 0..20 {
+            html.push_str(&format!(
+                "<p>Unrelated filler paragraph number {i} about gardening.</p>"
+            ));
+        }
+        html.push_str("<h2>Async runtimes</h2><p>Tokio schedules tasks on a work-stealing runtime.</p>");
+        html.push_str("<p>More gardening filler.</p></body>");
+        let page = extract(&html, None, 100_000);
+        let (out, truncated) = page.render_relevant("tokio runtime site:docs.rs", ContentFormat::Markdown, 300);
+        assert_eq!(
+            out,
+            "…\n\n## Async runtimes\n\nTokio schedules tasks on a work-stealing runtime.\n\n…"
+        );
+        assert!(truncated);
+        // Nothing matches: fall back to the lead of the page.
+        let (lead, _) = page.render_relevant("quantum chromodynamics", ContentFormat::Text, 40);
+        assert!(lead.starts_with("Cooking\nBread"), "{lead}");
+    }
+
+    #[test]
+    fn bm25_prefers_rarer_terms_and_denser_matches() {
+        let docs = vec![tokens("rust rust rust"), tokens("rust tokio"), tokens("gardening")];
+        let s = bm25(&query_terms("rust tokio"), &docs);
+        assert!(s[1] > s[0], "matching both terms beats repeating one: {s:?}");
+        assert_eq!(s[2], 0.0);
     }
 
     #[test]

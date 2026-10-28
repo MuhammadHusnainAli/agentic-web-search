@@ -27,8 +27,8 @@ use crate::{
     fetch::{BrowserPool, HttpFetcher},
     metrics::Metrics,
     model::{
-        ContentFormat, EngineChoice, EngineKind, FetchMode, RawResult, Region, SafeSearch, SearchResult, Strategy,
-        TimeRange,
+        ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, RawResult, Region, SafeSearch, SearchResult,
+        Strategy, TimeRange,
     },
 };
 
@@ -54,6 +54,7 @@ pub struct SearchRequest {
     pub include_content: bool,
     pub content_limit: u32,
     pub content_format: ContentFormat,
+    pub content_mode: ContentMode,
     pub content_max_chars: u32,
     pub content_timeout_ms: u32,
 }
@@ -662,6 +663,7 @@ impl SearchService {
     async fn attach_content(&self, results: &mut [SearchResult], req: &SearchRequest) {
         let limit = req.content_limit as usize;
         let (format, max_chars) = (req.content_format, req.content_max_chars as usize);
+        let query = &req.query;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(req.content_timeout_ms));
         let targets: Vec<(usize, String)> = results
             .iter()
@@ -672,7 +674,10 @@ impl SearchService {
         let fetched: Vec<(usize, Result<String, String>)> = stream::iter(targets)
             .map(|(i, url)| async move {
                 let text = match tokio::time::timeout_at(deadline, self.page(&url)).await {
-                    Ok(Ok(page)) => Ok(page.render(format, max_chars).0),
+                    Ok(Ok(page)) => Ok(match req.content_mode {
+                        ContentMode::Full => page.render(format, max_chars).0,
+                        ContentMode::Relevant => page.render_relevant(query, format, max_chars).0,
+                    }),
                     Ok(Err(e)) => {
                         tracing::debug!(%url, error = %e, "content fetch failed");
                         Err(e)
@@ -759,7 +764,7 @@ fn fuse(runs: &mut [EngineRun]) -> Vec<SearchResult> {
 }
 
 /// Words too common to signal relevance.
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "the", "and", "for", "how", "what", "with", "are", "you", "who", "why", "when", "where", "which", "does", "can",
     "from", "that", "this", "your", "into", "about", "was", "were", "has", "have", "not",
 ];
@@ -910,6 +915,7 @@ mod tests {
             include_content: false,
             content_limit: 0,
             content_format: ContentFormat::Markdown,
+            content_mode: ContentMode::Full,
             content_max_chars: 0,
             content_timeout_ms: 0,
         }

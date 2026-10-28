@@ -97,6 +97,7 @@ Build without the browser (smaller binary, no Chromium needed):
 | `include_content` | bool | false | fetch and extract the readable text of top results |
 | `content_limit` | int | 3 | how many results get `content` (≤ `CONTENT_MAX_RESULTS`) |
 | `content_format` | string | `markdown` | `markdown` (headings, lists, code, tables, links) or `text` |
+| `content_mode` | string | `full` | `full` (page from the top) or `relevant` (only the passages matching the query, with their headings) |
 | `content_max_chars` | int | `CONTENT_MAX_CHARS` | per-result text cap, cut on a word boundary |
 | `content_timeout_ms` | int | `CONTENT_TIMEOUT_SECS` | content deadline; slower pages get `content_error` instead |
 | `fresh` | bool | false | bypass the cache (the fresh result is cached) |

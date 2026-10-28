@@ -817,3 +817,45 @@ async fn validates_new_params() {
         assert!(msg.contains(needle), "{uri}: `{msg}` should mention `{needle}`");
     }
 }
+
+#[tokio::test]
+async fn relevant_content_mode_returns_matching_passages() {
+    let mock = MockServer::start().await;
+    let base = mock.uri();
+    mojeek()
+        .respond_with(html(mojeek_page(&base, "borrow checker", 1, 1)))
+        .mount(&mock)
+        .await;
+    let mut page = String::from("<body><h1>Rust book</h1>");
+    for i in 0..30 {
+        page.push_str(&format!("<p>Chapter filler {i} on cargo workspaces and crates.</p>"));
+    }
+    page.push_str("<h2>Ownership</h2><p>The borrow checker rejects dangling references.</p></body>");
+    Mock::given(path("/doc/1/1"))
+        .respond_with(html(page))
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    let ask = |mode: &str| {
+        post(json!({
+            "query": "borrow checker", "engine": "mojeek", "include_content": true,
+            "content_limit": 1, "content_max_chars": 200, "content_mode": mode
+        }))
+    };
+    let full = call(&app, ask("full")).await;
+    let full = full.json["results"][0]["content"].as_str().unwrap().to_owned();
+    assert!(
+        full.starts_with("# Rust book") && !full.contains("borrow checker"),
+        "{full}"
+    );
+
+    let r = call(&app, ask("relevant")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let relevant = r.json["results"][0]["content"].as_str().unwrap();
+    assert!(relevant.contains("## Ownership"), "{relevant}");
+    assert!(relevant.contains("The borrow checker rejects dangling references."));
+    assert!(!relevant.contains("filler"), "{relevant}");
+
+    let bad = call(&app, get("/v1/search?q=x&include_content=true&content_mode=summary")).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
