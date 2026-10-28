@@ -107,6 +107,18 @@ GET uses the same fields as query parameters, with lists comma-separated:
 
 Each result has `position`, `page`, `engine`, `title`, `url`, `domain` and `snippet`. It can also have
 `engines` (merge only: every engine that returned the URL), `content`, and `content_error`.
+With `include_content`, fetched pages also get `metadata`:
+
+```json
+"metadata": {
+  "title": "Rust 2024 Edition: What's New", "description": "The Rust 2024 Edition stabilized in Rust 1.85…",
+  "published": "2026-04-08", "modified": "2026-08-19", "author": "Rustify", "language": "en",
+  "site_name": "Rustify", "canonical_url": "https://rustify.rs/articles/rust-2024-edition-whats-new",
+  "final_url": "https://rustify.rs/articles/rust-2024-edition-whats-new", "word_count": 3137, "truncated": true
+}
+```
+
+These come from `<title>`, meta/OpenGraph tags, JSON-LD, `<time>` and `<html lang>`. Missing fields are omitted.
 The response also lists `engines_used`, and adds `warnings` when an engine can't apply a filter.
 
 ### Latency

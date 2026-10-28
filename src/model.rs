@@ -259,6 +259,34 @@ pub struct RawResult {
     pub snippet: String,
 }
 
+/// Facts about a fetched result page (only with `include_content`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Publication date as the page states it (usually ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
+    /// URL actually fetched, after redirects.
+    pub final_url: String,
+    /// Words of readable text on the whole page.
+    pub word_count: usize,
+    /// `content` holds only part of the page.
+    pub truncated: bool,
+}
+
 /// A normalised, ranked search result returned to callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchResult {
@@ -277,6 +305,8 @@ pub struct SearchResult {
     /// Extracted readable text of the target page (only with `include_content`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<PageMetadata>,
     /// Why `content` is missing for a result that was supposed to get it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_error: Option<String>,

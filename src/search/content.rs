@@ -11,7 +11,10 @@ use scraper::{Html, Node, Selector};
 use url::Url;
 
 use super::STOPWORDS;
-use crate::{engines::util::sel, model::ContentFormat};
+use crate::{
+    engines::util::{sel, text as element_text},
+    model::{ContentFormat, PageMetadata},
+};
 
 static ROOTS: LazyLock<[Selector; 4]> =
     LazyLock::new(|| [sel("article"), sel("main"), sel("[role='main']"), sel("body")]);
@@ -68,6 +71,8 @@ pub struct Block {
 #[derive(Debug, Clone, Default)]
 pub struct Page {
     pub blocks: Vec<Block>,
+    /// `truncated` is filled in per render.
+    pub meta: PageMetadata,
     /// Words in the whole readable page, including any part past the extraction limit.
     pub word_count: usize,
     /// Extraction stopped at its character limit.
@@ -77,11 +82,22 @@ pub struct Page {
 impl Page {
     /// Approximate heap size, for cache weighing.
     pub fn weight(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|b| b.text.len() + b.md.len() + 32)
-            .sum::<usize>()
-            + 64
+        let m = &self.meta;
+        let meta: usize = [
+            &m.title,
+            &m.description,
+            &m.published,
+            &m.modified,
+            &m.author,
+            &m.language,
+            &m.site_name,
+            &m.canonical_url,
+        ]
+        .iter()
+        .map(|f| f.as_ref().map_or(0, String::len))
+        .sum();
+        let blocks: usize = self.blocks.iter().map(|b| b.text.len() + b.md.len() + 32).sum();
+        blocks + meta + m.final_url.len() + 128
     }
 
     /// Render at most `max_chars` characters. Returns the content and whether
@@ -96,29 +112,61 @@ impl Page {
     pub fn render_relevant(&self, query: &str, format: ContentFormat, max_chars: usize) -> (String, bool) {
         let terms = query_terms(query);
         let docs: Vec<Vec<String>> = self.blocks.iter().map(|b| tokens(&b.text)).collect();
-        let scores = bm25(&terms, &docs);
+        let raw = bm25(&terms, &docs);
+        let is_heading = |i: usize| matches!(self.blocks[i].kind, BlockKind::Heading(_));
+        let heading_of = |i: usize| (0..i).rev().find(|&j| is_heading(j));
+        // Headings don't compete as passages (they're short and keyword-dense);
+        // a matching heading lifts the matching blocks of its section instead.
+        let scores: Vec<f64> = (0..self.blocks.len())
+            .map(|i| {
+                if is_heading(i) || raw[i] == 0.0 {
+                    0.0
+                } else {
+                    raw[i] + heading_of(i).map_or(0.0, |h| 0.5 * raw[h])
+                }
+            })
+            .collect();
         let mut ranked: Vec<usize> = (0..self.blocks.len()).filter(|&i| scores[i] > 0.0).collect();
         if ranked.is_empty() {
-            return self.render(format, max_chars);
+            // Only headings match: open the best-matching section.
+            let section = (0..self.blocks.len())
+                .filter(|&h| is_heading(h) && raw[h] > 0.0)
+                .max_by(|&a, &b| raw[a].total_cmp(&raw[b]).then(b.cmp(&a)))
+                .and_then(|h| (h + 1..self.blocks.len()).find(|&i| !is_heading(i)));
+            match section {
+                Some(i) => ranked.push(i),
+                None => return self.render(format, max_chars),
+            }
         }
         ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
 
-        // Greedily take the best blocks (and their headings) that fit the budget.
+        // Context a passage needs to make sense: its section heading, and for a
+        // table row, the table's header row.
+        let context = |i: usize| -> Vec<usize> {
+            let mut ctx: Vec<usize> = heading_of(i).into_iter().collect();
+            if let BlockKind::TableRow { header: false, .. } = self.blocks[i].kind {
+                let header = (0..i)
+                    .rev()
+                    .take_while(|&j| matches!(self.blocks[j].kind, BlockKind::TableRow { .. }))
+                    .find(|&j| matches!(self.blocks[j].kind, BlockKind::TableRow { header: true, .. }));
+                ctx.extend(header);
+            }
+            ctx
+        };
+
+        // Greedily take the best blocks (with their context) that fit the budget.
         let cost = |i: usize| self.blocks[i].md.chars().count() + 4;
         let mut picked = vec![false; self.blocks.len()];
         let mut used = 0;
         for i in ranked {
-            let heading = (0..i)
-                .rev()
-                .find(|&j| matches!(self.blocks[j].kind, BlockKind::Heading(_)))
-                .filter(|&j| !picked[j]);
-            let need = cost(i) + heading.map_or(0, cost);
+            let ctx: Vec<usize> = context(i).into_iter().filter(|&j| !picked[j]).collect();
+            let need = cost(i) + ctx.iter().map(|&j| cost(j)).sum::<usize>();
             if used + need > max_chars {
                 continue;
             }
             picked[i] = true;
-            if let Some(h) = heading {
-                picked[h] = true;
+            for j in ctx {
+                picked[j] = true;
             }
             used += need;
         }
@@ -140,7 +188,10 @@ impl Page {
         let mut chosen = Vec::new();
         let mut last: Option<usize> = None;
         for i in (0..self.blocks.len()).filter(|&i| picked[i]) {
-            if last.is_some_and(|l| i > l + 1) || (last.is_none() && i > 0) {
+            let is_row = |j: usize| matches!(self.blocks[j].kind, BlockKind::TableRow { .. });
+            // Rows skipped within one table aren't marked: a `…` would split the table.
+            let same_table = last.is_some_and(|l| (l..=i).all(is_row));
+            if (last.is_some_and(|l| i > l + 1) && !same_table) || (last.is_none() && i > 0) {
                 chosen.push(&gap);
             }
             chosen.push(&self.blocks[i]);
@@ -215,7 +266,9 @@ fn prefix(format: ContentFormat, kind: BlockKind) -> Cow<'static, str> {
         BlockKind::ListItem(None) => "- ".into(),
         BlockKind::ListItem(Some(n)) => format!("{n}. ").into(),
         BlockKind::Quote => "> ".into(),
-        BlockKind::Paragraph | BlockKind::Code | BlockKind::TableRow { .. } => "".into(),
+        // Only used for a row cut short; full rows are framed by `render_block`.
+        BlockKind::TableRow { .. } => "| ".into(),
+        BlockKind::Paragraph | BlockKind::Code => "".into(),
     }
 }
 
@@ -646,10 +699,191 @@ impl<'a> Builder<'a> {
     }
 }
 
+struct MetaSel {
+    title: Selector,
+    h1: Selector,
+    html: Selector,
+    canonical: Selector,
+    ld_json: Selector,
+    time: Selector,
+}
+
+static META: LazyLock<MetaSel> = LazyLock::new(|| MetaSel {
+    title: sel("title"),
+    h1: sel("h1"),
+    html: sel("html[lang]"),
+    canonical: sel("link[rel='canonical'][href]"),
+    ld_json: sel("script[type='application/ld+json']"),
+    time: sel("article time[datetime], main time[datetime], time[pubdate][datetime]"),
+});
+
+/// Collapse whitespace and cap the length of a metadata value.
+fn clean(s: &str, max: usize) -> Option<String> {
+    let mut out = String::new();
+    for w in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    let out = truncate_text(&out, max);
+    (!out.is_empty()).then(|| out.to_owned())
+}
+
+/// Accept only values that start like a date (`2024-05-01`, `2024/05/01T…`).
+fn date_like(s: &str) -> Option<String> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    let ok = b.len() >= 7 && b[..4].iter().all(u8::is_ascii_digit) && matches!(b[4], b'-' | b'/');
+    ok.then(|| truncate_text(s, 40).to_owned())
+}
+
+/// `<meta>` lookups, keyed by `name`, `property` or `itemprop` (lowercased).
+struct Metas<'a>(HashMap<String, &'a str>);
+
+impl<'a> Metas<'a> {
+    fn new(doc: &'a Html) -> Self {
+        static META_TAG: LazyLock<Selector> = LazyLock::new(|| sel("meta[content]"));
+        let mut map = HashMap::new();
+        for m in doc.select(&META_TAG) {
+            let el = m.value();
+            let Some(content) = el.attr("content") else { continue };
+            for key in ["name", "property", "itemprop"].iter().filter_map(|a| el.attr(a)) {
+                // First occurrence wins, like browsers and scrapers usually do.
+                map.entry(key.trim().to_ascii_lowercase()).or_insert(content);
+            }
+        }
+        Self(map)
+    }
+
+    /// First non-empty value among `keys`, in priority order.
+    fn get(&self, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|k| self.0.get(*k).and_then(|c| clean(c, 500)))
+    }
+}
+
+/// Facts from JSON-LD (`<script type="application/ld+json">`) blocks.
+#[derive(Default)]
+struct LdFacts {
+    published: Option<String>,
+    modified: Option<String>,
+    author: Option<String>,
+    headline: Option<String>,
+}
+
+fn ld_name(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => clean(s, 200),
+        serde_json::Value::Object(o) => o.get("name").and_then(|n| n.as_str()).and_then(|n| clean(n, 200)),
+        serde_json::Value::Array(a) => a.iter().find_map(ld_name),
+        _ => None,
+    }
+}
+
+fn ld_walk(v: &serde_json::Value, depth: u8, f: &mut LdFacts) {
+    use serde_json::Value;
+    if depth > 6 {
+        return;
+    }
+    match v {
+        Value::Array(items) => items.iter().for_each(|i| ld_walk(i, depth + 1, f)),
+        Value::Object(map) => {
+            let str_of = |k: &str| map.get(k).and_then(Value::as_str);
+            if f.published.is_none() {
+                f.published = str_of("datePublished").and_then(date_like);
+            }
+            if f.modified.is_none() {
+                f.modified = str_of("dateModified").and_then(date_like);
+            }
+            if f.headline.is_none() {
+                f.headline = str_of("headline").and_then(|h| clean(h, 300));
+            }
+            if f.author.is_none() {
+                f.author = map.get("author").and_then(ld_name);
+            }
+            map.values()
+                .filter(|v| v.is_object() || v.is_array())
+                .for_each(|v| ld_walk(v, depth + 1, f));
+        }
+        _ => {}
+    }
+}
+
+fn metadata(doc: &Html, base: Option<&Url>) -> PageMetadata {
+    let m = &*META;
+    let metas = Metas::new(doc);
+    let mut ld = LdFacts::default();
+    for script in doc.select(&m.ld_json).take(8) {
+        let raw: String = script.text().collect();
+        if raw.len() <= 256 * 1024
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            ld_walk(&v, 0, &mut ld);
+        }
+    }
+    let resolve = |href: &str| {
+        let url = match base {
+            Some(b) => b.join(href).ok()?,
+            None => Url::parse(href).ok()?,
+        };
+        matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+    };
+    let first_text = |s: &Selector| doc.select(s).next().and_then(|t| clean(&element_text(t), 300));
+    PageMetadata {
+        title: metas
+            .get(&["og:title", "twitter:title"])
+            .or_else(|| first_text(&m.title))
+            .or(ld.headline)
+            .or_else(|| first_text(&m.h1)),
+        description: metas.get(&["description", "og:description", "twitter:description"]),
+        published: metas
+            .get(&[
+                "article:published_time",
+                "datepublished",
+                "publish-date",
+                "pubdate",
+                "date",
+                "dc.date",
+                "dc.date.issued",
+            ])
+            .and_then(|d| date_like(&d))
+            .or(ld.published)
+            .or_else(|| {
+                doc.select(&m.time)
+                    .find_map(|t| t.value().attr("datetime").and_then(date_like))
+            }),
+        modified: metas
+            .get(&["article:modified_time", "og:updated_time", "datemodified"])
+            .and_then(|d| date_like(&d))
+            .or(ld.modified),
+        author: metas
+            .get(&["author", "article:author", "dc.creator"])
+            // `article:author` is often a profile URL rather than a name.
+            .filter(|a| !a.starts_with("http"))
+            .or(ld.author),
+        language: doc
+            .select(&m.html)
+            .next()
+            .and_then(|h| h.value().attr("lang"))
+            .and_then(|l| clean(l, 20))
+            .map(|l| l.to_ascii_lowercase()),
+        site_name: metas.get(&["og:site_name", "application-name"]),
+        canonical_url: doc
+            .select(&m.canonical)
+            .next()
+            .and_then(|l| l.value().attr("href"))
+            .and_then(resolve),
+        final_url: base.map(Url::to_string).unwrap_or_default(),
+        word_count: 0,
+        truncated: false,
+    }
+}
+
 /// Extract the main readable content of `html`, keeping at most `max_chars`
 /// characters of text. Relative links resolve against `base`.
 pub fn extract(html: &str, base: Option<&Url>, max_chars: usize) -> Page {
     let doc = Html::parse_document(html);
+    let meta = metadata(&doc, base);
     let root = ROOTS
         .iter()
         .find_map(|s| doc.select(s).next())
@@ -677,7 +911,12 @@ pub fn extract(html: &str, base: Option<&Url>, max_chars: usize) -> Page {
         }
     }
     b.flush();
-    b.page
+    let mut page = b.page;
+    page.meta = PageMetadata {
+        word_count: page.word_count,
+        ..meta
+    };
+    page
 }
 
 #[cfg(test)]
@@ -806,6 +1045,25 @@ mod tests {
         // Nothing matches: fall back to the lead of the page.
         let (lead, _) = page.render_relevant("quantum chromodynamics", ContentFormat::Text, 40);
         assert!(lead.starts_with("Cooking\nBread"), "{lead}");
+        // Only a heading matches: its section's first passage is returned.
+        let (section, _) = page.render_relevant("async runtimes", ContentFormat::Markdown, 300);
+        assert!(section.contains("## Async runtimes\n\nTokio schedules"), "{section}");
+    }
+
+    #[test]
+    fn relevant_mode_favours_passages_over_headings_and_keeps_table_headers() {
+        let html = "<h2>Rust edition</h2><p>Unrelated intro.</p>\
+            <h2>Release schedule</h2><p>The edition ships with each release train.</p>\
+            <table><tr><th>Date</th><th>Event</th></tr><tr><td>2025-01-03</td><td>beta</td></tr>\
+            <tr><td>2025-02-20</td><td>edition release</td></tr></table>";
+        let page = extract(html, None, 10_000);
+        let (out, _) = page.render_relevant("edition release", ContentFormat::Markdown, 160);
+        assert!(!out.contains("Unrelated intro"), "{out}");
+        assert!(out.contains("The edition ships"), "a passage, not just headings: {out}");
+        assert!(
+            out.ends_with("| Date | Event |\n| --- | --- |\n| 2025-02-20 | edition release |"),
+            "table rows keep their header, as one table: {out}"
+        );
     }
 
     #[test]
@@ -814,6 +1072,47 @@ mod tests {
         let s = bm25(&query_terms("rust tokio"), &docs);
         assert!(s[1] > s[0], "matching both terms beats repeating one: {s:?}");
         assert_eq!(s[2], 0.0);
+    }
+
+    #[test]
+    fn extracts_page_metadata() {
+        let html = r#"<html lang="EN-us"><head>
+            <title> Tokio  tutorial | Tokio </title>
+            <meta name="description" content="Learn   async Rust.">
+            <meta property="og:site_name" content="Tokio">
+            <meta property="article:published_time" content="2024-03-05T10:00:00Z">
+            <meta name="article:author" content="https://example.com/u/alice">
+            <link rel="canonical" href="/tokio/tutorial">
+            <script type="application/ld+json">{"@graph":[{"@type":"Article",
+              "dateModified":"2024-04-01","author":[{"@type":"Person","name":"Alice Doe"}]}]}</script>
+            </head><body><article><p>one two three</p></article></body></html>"#;
+        let base = Url::parse("https://tokio.rs/tokio/tutorial?ref=x").unwrap();
+        let m = extract(html, Some(&base), 1000).meta;
+        assert_eq!(m.title.as_deref(), Some("Tokio tutorial | Tokio"));
+        assert_eq!(m.description.as_deref(), Some("Learn async Rust."));
+        assert_eq!(m.site_name.as_deref(), Some("Tokio"));
+        assert_eq!(m.published.as_deref(), Some("2024-03-05T10:00:00Z"));
+        assert_eq!(m.modified.as_deref(), Some("2024-04-01"));
+        assert_eq!(m.author.as_deref(), Some("Alice Doe"), "profile URLs aren't names");
+        assert_eq!(m.language.as_deref(), Some("en-us"));
+        assert_eq!(m.canonical_url.as_deref(), Some("https://tokio.rs/tokio/tutorial"));
+        assert_eq!(m.final_url, "https://tokio.rs/tokio/tutorial?ref=x");
+        assert_eq!(m.word_count, 3);
+    }
+
+    #[test]
+    fn metadata_falls_back_and_rejects_junk() {
+        let html = r#"<html><head><meta name="date" content="last tuesday"></head>
+            <body><main><h1>Fallback title</h1><time datetime="2023-12-24">Dec 24</time>
+            <script type="application/ld+json">{not json</script></main></body></html>"#;
+        let m = extract(html, None, 1000).meta;
+        assert_eq!(m.title.as_deref(), Some("Fallback title"));
+        assert_eq!(
+            m.published.as_deref(),
+            Some("2023-12-24"),
+            "junk meta date skipped for <time>"
+        );
+        assert!(m.description.is_none() && m.author.is_none() && m.language.is_none());
     }
 
     #[test]

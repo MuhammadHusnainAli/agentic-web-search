@@ -859,3 +859,45 @@ async fn relevant_content_mode_returns_matching_passages() {
     let bad = call(&app, get("/v1/search?q=x&include_content=true&content_mode=summary")).await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn content_comes_with_page_metadata() {
+    let mock = MockServer::start().await;
+    let base = mock.uri();
+    mojeek()
+        .respond_with(html(mojeek_page(&base, "metadata", 1, 2)))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/doc/1/1"))
+        .respond_with(html(
+            r#"<html lang="en"><head><title>Doc title</title>
+            <meta name="description" content="What this page is about.">
+            <meta property="article:published_time" content="2025-01-02T03:04:05Z"></head>
+            <body><article><p>Some words for the counter here.</p></article></body></html>"#,
+        ))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/doc/1/2"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    let r = call(
+        &app,
+        post(json!({"query": "metadata", "engine": "mojeek", "include_content": true, "content_limit": 2})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let m = &r.json["results"][0]["metadata"];
+    assert_eq!(m["title"], "Doc title");
+    assert_eq!(m["description"], "What this page is about.");
+    assert_eq!(m["published"], "2025-01-02T03:04:05Z");
+    assert_eq!(m["language"], "en");
+    assert_eq!(m["final_url"], format!("{base}/doc/1/1"));
+    assert_eq!(m["word_count"], 6);
+    assert_eq!(m["truncated"], false);
+    assert!(m.get("author").is_none(), "absent fields are omitted");
+    let failed = &r.json["results"][1];
+    assert!(failed.get("metadata").is_none());
+    assert_eq!(failed["content_error"], "HTTP 404");
+}

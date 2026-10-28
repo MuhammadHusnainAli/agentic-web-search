@@ -27,8 +27,8 @@ use crate::{
     fetch::{BrowserPool, HttpFetcher},
     metrics::Metrics,
     model::{
-        ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, RawResult, Region, SafeSearch, SearchResult,
-        Strategy, TimeRange,
+        ContentFormat, ContentMode, EngineChoice, EngineKind, FetchMode, PageMetadata, RawResult, Region, SafeSearch,
+        SearchResult, Strategy, TimeRange,
     },
 };
 
@@ -135,6 +135,9 @@ struct Outcome {
     tried: Vec<EngineKind>,
     failures: Vec<EngineFailure>,
 }
+
+/// Rendered content and page facts for one result, or why there are none.
+type ContentOutcome = Result<(String, PageMetadata), String>;
 
 pub struct SearchService {
     cfg: Arc<Config>,
@@ -522,6 +525,7 @@ impl SearchService {
                             snippet: r.snippet,
                             engines: Vec::new(),
                             content: None,
+                            metadata: None,
                             content_error: None,
                         });
                     }
@@ -671,13 +675,20 @@ impl SearchService {
             .enumerate()
             .map(|(i, r)| (i, r.url.clone()))
             .collect();
-        let fetched: Vec<(usize, Result<String, String>)> = stream::iter(targets)
+        let fetched: Vec<(usize, ContentOutcome)> = stream::iter(targets)
             .map(|(i, url)| async move {
                 let text = match tokio::time::timeout_at(deadline, self.page(&url)).await {
-                    Ok(Ok(page)) => Ok(match req.content_mode {
-                        ContentMode::Full => page.render(format, max_chars).0,
-                        ContentMode::Relevant => page.render_relevant(query, format, max_chars).0,
-                    }),
+                    Ok(Ok(page)) => {
+                        let (content, truncated) = match req.content_mode {
+                            ContentMode::Full => page.render(format, max_chars),
+                            ContentMode::Relevant => page.render_relevant(query, format, max_chars),
+                        };
+                        let meta = PageMetadata {
+                            truncated,
+                            ..page.meta.clone()
+                        };
+                        Ok((content, meta))
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!(%url, error = %e, "content fetch failed");
                         Err(e)
@@ -694,8 +705,14 @@ impl SearchService {
             .await;
         for (i, text) in fetched {
             match text {
-                Ok(t) if !t.is_empty() => results[i].content = Some(t),
-                Ok(_) => results[i].content_error = Some("no readable text".into()),
+                Ok((t, meta)) => {
+                    if t.is_empty() {
+                        results[i].content_error = Some("no readable text".into());
+                    } else {
+                        results[i].content = Some(t);
+                    }
+                    results[i].metadata = Some(meta);
+                }
                 Err(e) => results[i].content_error = Some(e),
             }
         }
@@ -962,6 +979,7 @@ mod tests {
             snippet: snippet.into(),
             engines: Vec::new(),
             content: None,
+            metadata: None,
             content_error: None,
         };
         let run = |engine, urls: &[(&str, &str)]| EngineRun {
