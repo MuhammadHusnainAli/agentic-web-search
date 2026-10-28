@@ -33,7 +33,12 @@ use tower_http::{
 };
 
 use self::models::{EngineInfo, SearchParams, SearchResponse};
-use crate::{error::AppError, metrics::Metrics, model::EngineKind, state::SharedState};
+use crate::{
+    error::AppError,
+    metrics::Metrics,
+    model::{EngineKind, TimeRange},
+    state::SharedState,
+};
 
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 static X_CACHE: HeaderName = HeaderName::from_static("x-cache");
@@ -120,13 +125,15 @@ async fn search_post(
 async fn run_search(state: SharedState, params: SearchParams) -> Result<Response, AppError> {
     let started = Instant::now();
     Metrics::inc(&state.metrics.requests);
+    let fresh = params.fresh.unwrap_or(false);
     let req = params.validate(&state.cfg, state.search.browser().is_enabled())?;
-    let (out, cached) = state.search.search(&req).await?;
+    let (out, cached) = state.search.search(&req, fresh).await?;
 
     let body = SearchResponse {
         query: &req.query,
         engine: out.engine,
         engines_tried: &out.engines_tried,
+        engines_used: &out.engines_used,
         pages_requested: req.pages,
         pages_fetched: out.pages_fetched,
         total_results: out.total_results,
@@ -134,6 +141,7 @@ async fn run_search(state: SharedState, params: SearchParams) -> Result<Response
         elapsed_ms: started.elapsed().as_millis() as u64,
         results: &out.results,
         errors: &out.errors,
+        warnings: &out.warnings,
     };
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(
@@ -149,11 +157,16 @@ async fn engines(State(state): State<SharedState>) -> Json<Vec<EngineInfo>> {
         EngineKind::ALL
             .iter()
             .map(|&name| {
-                let requires_browser = state.search.engines().get(name).requires_js();
+                let engine = state.search.engines().get(name);
+                let requires_browser = engine.requires_js();
                 EngineInfo {
                     name,
                     requires_browser,
                     available: browser || !requires_browser,
+                    time_ranges: [TimeRange::Day, TimeRange::Week, TimeRange::Month, TimeRange::Year]
+                        .into_iter()
+                        .filter(|t| engine.supports_time_range(*t))
+                        .collect(),
                 }
             })
             .collect(),

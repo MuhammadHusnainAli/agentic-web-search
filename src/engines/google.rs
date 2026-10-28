@@ -85,6 +85,9 @@ impl Engine for Google {
                 }
                 SafeSearch::Moderate => {}
             }
+            if let Some(t) = q.time_range {
+                p.append_pair("tbs", &format!("qdr:{}", t.letter()));
+            }
             if q.page > 0 {
                 p.append_pair("start", &(q.page * 10).to_string());
             }

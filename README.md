@@ -82,15 +82,41 @@ Build without the browser (smaller binary, no Chromium needed):
 |---|---|---|---|
 | `query` (`q`) | string | required | ≤ `MAX_QUERY_LEN` chars |
 | `engine` | string | `DEFAULT_ENGINE` (`auto`) | `auto`, `bing`, `brave`, `duckduckgo`/`ddg`, `yahoo`, `mojeek`, `google` |
+| `engines` | list | `FALLBACK_ENGINES` | engines `auto` may use, in priority order |
+| `strategy` | string | `fallback` | `auto` only. `fallback`: in order, hedging slow engines. `race`: all at once, fastest wins. `merge`: all at once, rankings fused |
 | `pages` | int | 1 | `1..=MAX_PAGES`, fetched concurrently |
 | `mode` | string | `auto` | `auto` (HTTP → browser fallback), `http`, `browser` |
 | `region` | string | `us-en` | `<country>-<language>` |
 | `safe_search` | string | `moderate` | `off`, `moderate`, `strict` |
+| `time_range` | string | – | `day`, `week`, `month`, `year` (native per-engine filter; see `/v1/engines`) |
+| `include_domains` (`site`) | list | – | only these domains (subdomains included), ≤ 10 |
+| `exclude_domains` | list | – | never these domains, ≤ 10 |
+| `file_type` | string | – | e.g. `pdf` |
+| `unique_domains` | bool | false | keep only the best result per domain |
 | `max_results` | int | – | truncate after merge (≤ 200) |
-| `include_content` | bool | false | fetch and extract the text of top results |
-| `content_limit` | int | 3 | how many results get `content` |
+| `include_content` | bool | false | fetch and extract the readable text of top results |
+| `content_limit` | int | 3 | how many results get `content` (≤ `CONTENT_MAX_RESULTS`) |
+| `content_max_chars` | int | `CONTENT_MAX_CHARS` | per-result text cap, cut on a word boundary |
+| `content_timeout_ms` | int | `CONTENT_TIMEOUT_SECS` | content deadline; slower pages get `content_error` instead |
+| `fresh` | bool | false | bypass the cache (the fresh result is cached) |
 
-GET uses the same fields as query parameters: `/v1/search?q=rust&engine=brave&pages=2`.
+GET uses the same fields as query parameters, with lists comma-separated:
+`/v1/search?q=rust&engines=bing,brave&strategy=merge&time_range=month&site=docs.rs`.
+
+Each result has `position`, `page`, `engine`, `title`, `url`, `domain` and `snippet`. It can also have
+`engines` (merge only: every engine that returned the URL), `content`, and `content_error`.
+The response also lists `engines_used`, and adds `warnings` when an engine can't apply a filter.
+
+### Latency
+
+- **Hedged fallback.** `auto` doesn't wait for a slow engine. After `HEDGE_DELAY_MS` (1200), the next
+  engine starts in parallel and the first with results wins. A failing engine is replaced immediately.
+  Losers are cancelled.
+- **Merge grace.** `merge` waits at most `MERGE_GRACE_MS` (1500) after the first engine answers.
+- **Content deadline.**
+  - Page fetches share one deadline, so a slow site never holds the response.
+  - Extraction runs on the blocking pool, capped at the core count.
+  - Extracted text is cached by URL across searches (`CONTENT_CACHE_MB`).
 
 ### Other endpoints
 
@@ -161,9 +187,22 @@ The ones that matter most:
   | `/health` | ~220,000 req/s | 0.5 ms | 1.5 ms |
 
   Resident memory stayed around 60 MB under that load.
-- **Cache misses** are bound by the upstream engines, not by this service. Plain-HTTP misses cost a few
-  milliseconds of CPU, mostly HTML parsing. Browser misses cost a Chromium tab for one to a few seconds,
-  which is why the browser is a fallback.
+- **Cache misses** are bound by the upstream engines, not by this service. Measured with
+  `examples/mock_upstream.rs`, which serves real SERP markup with 50 ms engine latency and
+  30 ms result pages. Every request used a unique query, with 256 connections and 0 errors:
+
+  | Scenario | Throughput | p50 | p99 |
+  |---|---|---|---|
+  | one engine | ~4,900 req/s | 52 ms | 55 ms |
+  | `auto`, 3 pages | ~4,700 req/s | 54 ms | 63 ms |
+  | `strategy=merge`, 5 engines | ~3,900 req/s | 65 ms | 80 ms |
+  | one engine + content of top 3 | ~2,650 req/s | 95 ms | 108 ms |
+  | first engine stalls 2 s: no hedging / default / `HEDGE_DELAY_MS=300` / `race` | – | 2003 / 1254 / 354 / 65 ms | – |
+
+  The service adds about 2 ms over upstream latency. Memory is bounded by `CACHE_MAX_MB` +
+  `CONTENT_CACHE_MB` plus the in-flight working set. With overload (`MAX_CONCURRENT_REQUESTS`) and rate
+  limits hit, excess requests get immediate 503 / 429 responses (p99 < 10 ms).
+  Browser misses cost a Chromium tab for one to a few seconds, which is why the browser is a fallback.
 - **Stateless**: scale horizontally behind any load balancer. Each replica keeps its own cache.
   A shared Redis cache is on the roadmap.
 
@@ -171,6 +210,12 @@ Load test:
 
 ```bash
 cargo run --release --example loadtest -- "http://127.0.0.1:8080/v1/search?q=rust&engine=brave" "$KEY" 256 10
+
+# Cache-miss path against fake engines: `{n}` makes every query unique.
+cargo run --release --example mock_upstream -- 127.0.0.1:9100 &
+for e in BING BRAVE DUCKDUCKGO GOOGLE YAHOO MOJEEK; do export ENGINE_${e}_URL=http://127.0.0.1:9100/; done
+CONTENT_ALLOW_PRIVATE_IPS=true BROWSER_ENABLED=false cargo run --release &
+cargo run --release --example loadtest -- "http://127.0.0.1:8080/v1/search?q=rust+{n}&strategy=merge" "$KEY" 256 10
 ```
 
 ## Honest limitations

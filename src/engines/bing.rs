@@ -8,7 +8,7 @@ use super::{
     Engine, PageQuery, UpstreamRequest,
     util::{absolute_http, contains_any_ci, first_text, generic_block, sel, text},
 };
-use crate::model::{EngineKind, RawResult, SafeSearch};
+use crate::model::{EngineKind, RawResult, SafeSearch, TimeRange};
 
 struct Sel {
     item: Selector,
@@ -52,6 +52,22 @@ fn unwrap_link(url: Url) -> Option<Url> {
     matches!(target.scheme(), "http" | "https").then_some(target)
 }
 
+/// Bing's freshness filter: `ez1..3` for day/week/month, an explicit range of
+/// days since the Unix epoch for anything longer.
+fn time_filter(t: TimeRange) -> String {
+    match t {
+        TimeRange::Day => r#"ex1:"ez1""#.into(),
+        TimeRange::Week => r#"ex1:"ez2""#.into(),
+        TimeRange::Month => r#"ex1:"ez3""#.into(),
+        TimeRange::Year => {
+            let today = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() / 86_400);
+            format!(r#"ex1:"ez5_{}_{today}""#, today.saturating_sub(t.days()))
+        }
+    }
+}
+
 impl Engine for Bing {
     fn kind(&self) -> EngineKind {
         EngineKind::Bing
@@ -75,6 +91,9 @@ impl Engine for Bing {
                         SafeSearch::Strict => "strict",
                     },
                 );
+            if let Some(t) = q.time_range {
+                p.append_pair("filters", &time_filter(t));
+            }
             if q.page > 0 {
                 p.append_pair("first", &(q.page * 10 + 1).to_string())
                     .append_pair("FORM", "PERE");

@@ -50,6 +50,9 @@ impl Engine for Brave {
         {
             let mut p = url.query_pairs_mut();
             p.append_pair("q", q.query).append_pair("source", "web");
+            if let Some(t) = q.time_range {
+                p.append_pair("tf", &format!("p{}", t.letter()));
+            }
             if q.page > 0 {
                 p.append_pair("offset", &q.page.to_string());
             }

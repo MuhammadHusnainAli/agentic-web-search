@@ -7,7 +7,7 @@ use super::{
     Engine, PageQuery, UpstreamRequest,
     util::{absolute_http, contains_any_ci, first_text, generic_block, sel, text},
 };
-use crate::model::{EngineKind, RawResult, SafeSearch};
+use crate::model::{EngineKind, RawResult, SafeSearch, TimeRange};
 
 struct Sel {
     item: Selector,
@@ -53,6 +53,11 @@ impl Engine for Mojeek {
             }
         }
         UpstreamRequest::get(url)
+    }
+
+    /// Mojeek has no recency filter.
+    fn supports_time_range(&self, _range: TimeRange) -> bool {
+        false
     }
 
     fn ready_selector(&self) -> &'static str {

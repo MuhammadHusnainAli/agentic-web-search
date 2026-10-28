@@ -58,6 +58,12 @@ pub struct Config {
     pub max_query_len: usize,
     /// How long an engine's HTTP path is skipped after it was detected as blocked.
     pub block_cooldown: Duration,
+    /// `strategy=fallback`: start the next engine if the current one hasn't
+    /// answered after this long. Bounds tail latency of slow engines.
+    pub hedge_delay: Duration,
+    /// `strategy=merge`: once the first engine answers, wait at most this long
+    /// for the others.
+    pub merge_grace: Duration,
 
     // --- upstream fetching ---
     pub upstream_timeout: Duration,
@@ -76,6 +82,11 @@ pub struct Config {
     pub content_max_chars: usize,
     pub content_max_concurrency: usize,
     pub content_max_results: usize,
+    /// Default deadline for all content fetches of one search; pages that miss
+    /// it come back without `content`.
+    pub content_timeout: Duration,
+    /// Memory budget for extracted page text, shared across searches.
+    pub content_cache_max_bytes: u64,
     /// Allow fetching content from private / loopback addresses (SSRF guard off). Tests only.
     pub content_allow_private_ips: bool,
 
@@ -119,6 +130,8 @@ impl Default for Config {
             max_pages: 5,
             max_query_len: 512,
             block_cooldown: Duration::from_secs(120),
+            hedge_delay: Duration::from_millis(1200),
+            merge_grace: Duration::from_millis(1500),
             upstream_timeout: Duration::from_secs(10),
             max_upstream_concurrency: 256,
             max_body_bytes: 3 * 1024 * 1024,
@@ -128,8 +141,10 @@ impl Default for Config {
             cache_ttl: Duration::from_secs(900),
             cache_max_bytes: 256 * 1024 * 1024,
             content_max_chars: 8_000,
-            content_max_concurrency: 8,
+            content_max_concurrency: 32,
             content_max_results: 10,
+            content_timeout: Duration::from_secs(5),
+            content_cache_max_bytes: 64 * 1024 * 1024,
             content_allow_private_ips: false,
             browser: BrowserSettings {
                 enabled: cfg!(feature = "browser"),
@@ -265,6 +280,8 @@ impl Config {
             max_pages: parse("MAX_PAGES", d.max_pages)?,
             max_query_len: parse("MAX_QUERY_LEN", d.max_query_len)?,
             block_cooldown: parse_secs("BLOCK_COOLDOWN_SECS", d.block_cooldown)?,
+            hedge_delay: Duration::from_millis(parse("HEDGE_DELAY_MS", d.hedge_delay.as_millis() as u64)?),
+            merge_grace: Duration::from_millis(parse("MERGE_GRACE_MS", d.merge_grace.as_millis() as u64)?),
             upstream_timeout: parse_secs("UPSTREAM_TIMEOUT_SECS", d.upstream_timeout)?,
             max_upstream_concurrency: parse("MAX_UPSTREAM_CONCURRENCY", d.max_upstream_concurrency)?,
             max_body_bytes: parse("MAX_BODY_BYTES", d.max_body_bytes)?,
@@ -276,6 +293,10 @@ impl Config {
             content_max_chars: parse("CONTENT_MAX_CHARS", d.content_max_chars)?,
             content_max_concurrency: parse("CONTENT_MAX_CONCURRENCY", d.content_max_concurrency)?,
             content_max_results: parse("CONTENT_MAX_RESULTS", d.content_max_results)?,
+            content_timeout: parse_secs("CONTENT_TIMEOUT_SECS", d.content_timeout)?,
+            content_cache_max_bytes: parse::<u64>("CONTENT_CACHE_MB", d.content_cache_max_bytes / (1024 * 1024))?
+                * 1024
+                * 1024,
             content_allow_private_ips: parse_bool("CONTENT_ALLOW_PRIVATE_IPS", d.content_allow_private_ips)?,
             browser: BrowserSettings {
                 enabled: parse_bool("BROWSER_ENABLED", d.browser.enabled)?,

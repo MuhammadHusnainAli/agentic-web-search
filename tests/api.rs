@@ -506,3 +506,301 @@ async fn compresses_when_client_accepts_it() {
     let resp = app(cfg).oneshot(req).await.unwrap();
     assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
 }
+
+/// Bing-style SERP with arbitrary result URLs.
+fn bing_page(urls: &[&str], query: &str) -> String {
+    let items: String = urls
+        .iter()
+        .map(|u| {
+            format!(r#"<li class="b_algo"><h2><a href="{u}">{u}</a></h2><div class="b_caption"><p>About {query}: {u}</p></div></li>"#)
+        })
+        .collect();
+    format!(r#"<html><head><title>q - Bing</title></head><body><ol id="b_results">{items}</ol></body></html>"#)
+}
+
+fn bing() -> wiremock::MockBuilder {
+    Mock::given(path("/search")).and(query_param("mkt", "en-US"))
+}
+
+fn mojeek() -> wiremock::MockBuilder {
+    Mock::given(path("/search")).and(query_param("lb", "en"))
+}
+
+#[tokio::test]
+async fn slow_engine_is_hedged_instead_of_waited_for() {
+    let mock = MockServer::start().await;
+    bing()
+        .respond_with(html(bing_page(&["https://slow.example/"], "hedge")).set_delay(Duration::from_secs(4)))
+        .mount(&mock)
+        .await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "hedge", 1, 3)))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.hedge_delay = Duration::from_millis(150);
+    let app = app(cfg);
+    let started = std::time::Instant::now();
+    let r = call(&app, get("/v1/search?q=hedge&engines=bing,mojeek")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!(r.json["engine"], "mojeek");
+    assert_eq!(r.json["engines_tried"], json!(["bing", "mojeek"]));
+}
+
+#[tokio::test]
+async fn race_starts_every_engine_at_once() {
+    let mock = MockServer::start().await;
+    bing()
+        .respond_with(html(bing_page(&["https://a.example/"], "race")).set_delay(Duration::from_millis(800)))
+        .mount(&mock)
+        .await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "race", 1, 2)).set_delay(Duration::from_millis(300)))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.hedge_delay = Duration::from_secs(10);
+    let app = app(cfg);
+    let started = std::time::Instant::now();
+    let r = call(
+        &app,
+        post(json!({"query": "race", "engines": ["bing", "mojeek"], "strategy": "race"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["engine"], "mojeek");
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn merge_fuses_engines_and_drops_stragglers() {
+    let mock = MockServer::start().await;
+    let base = mock.uri();
+    let shared = format!("{base}/doc/1/2");
+    bing()
+        .respond_with(html(bing_page(&["https://only-bing.example/", &shared], "merge")))
+        .mount(&mock)
+        .await;
+    mojeek()
+        .respond_with(html(mojeek_page(&base, "merge", 1, 3)))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/search"))
+        .and(query_param("source", "web"))
+        .respond_with(html(fixture("brave.html")).set_delay(Duration::from_secs(4)))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.merge_grace = Duration::from_millis(200);
+    let app = app(cfg);
+    let r = call(&app, get("/v1/search?q=merge&engines=bing,mojeek,brave&strategy=merge")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["engines_used"], json!(["bing", "mojeek"]));
+    let results = r.json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4, "shared URL de-duplicated");
+    assert_eq!(results[0]["url"], shared, "URL both engines agree on ranks first");
+    assert_eq!(results[0]["engines"], json!(["bing", "mojeek"]));
+    for (i, res) in results.iter().enumerate() {
+        assert_eq!(res["position"], i + 1);
+    }
+    let errors = r.json["errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["engine"] == "brave" && e["error"].as_str().unwrap().contains("dropped")),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn domain_and_file_type_filters() {
+    let mock = MockServer::start().await;
+    bing()
+        .and(query_param(
+            "q",
+            "tokio (site:a.com OR site:b.org) -site:x.a.com filetype:pdf",
+        ))
+        .respond_with(html(bing_page(
+            &[
+                "https://a.com/1",
+                "https://www.a.com/2",
+                "https://x.a.com/3",
+                "https://docs.b.org/4",
+                "https://evil.com/5",
+                "https://nota.com/6",
+            ],
+            "tokio",
+        )))
+        .expect(2) // second request differs only in unique_domains
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    let r = call(
+        &app,
+        post(json!({
+            "query": "tokio", "engine": "bing", "file_type": "PDF",
+            "include_domains": ["b.org", "https://www.a.com/"], "exclude_domains": "x.a.com"
+        })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let domains: Vec<&str> = r.json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(domains, ["a.com", "a.com", "docs.b.org"]);
+
+    let r = call(
+        &app,
+        post(json!({
+            "query": "tokio", "engine": "bing", "file_type": "pdf", "unique_domains": true,
+            "include_domains": ["a.com", "b.org"], "exclude_domains": ["x.a.com"]
+        })),
+    )
+    .await;
+    assert_eq!(r.json["cached"], false, "unique_domains is part of the cache key");
+    let results = r.json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[1]["position"], 2);
+}
+
+#[tokio::test]
+async fn time_range_is_forwarded_or_warned_about() {
+    let mock = MockServer::start().await;
+    bing()
+        .and(query_param("filters", r#"ex1:"ez2""#))
+        .respond_with(html(bing_page(&["https://a.com/"], "news")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "news", 1, 2)))
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    let r = call(&app, get("/v1/search?q=news&engine=bing&time_range=week")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(r.json.get("warnings").is_none());
+
+    let r = call(&app, get("/v1/search?q=news&engine=mojeek&time_range=week")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.json["warnings"][0].as_str().unwrap().contains("mojeek"));
+
+    let r = call(&app, get("/v1/engines")).await;
+    let mojeek = r
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "mojeek")
+        .unwrap();
+    assert_eq!(mojeek["time_ranges"], json!([]));
+}
+
+#[tokio::test]
+async fn content_respects_deadline_and_char_limit() {
+    let mock = MockServer::start().await;
+    let base = mock.uri();
+    mojeek()
+        .respond_with(html(mojeek_page(&base, "deadline", 1, 2)))
+        .mount(&mock)
+        .await;
+    let long = "word ".repeat(400);
+    Mock::given(path("/doc/1/1"))
+        .respond_with(html(format!("<body><p>{long}</p></body>")))
+        .expect(1) // second search reuses the content cache
+        .mount(&mock)
+        .await;
+    Mock::given(path("/doc/1/2"))
+        .respond_with(html("<body><p>slow</p></body>").set_delay(Duration::from_secs(3)))
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    let started = std::time::Instant::now();
+    let r = call(
+        &app,
+        post(json!({
+            "query": "deadline", "engine": "mojeek", "include_content": true,
+            "content_limit": 2, "content_max_chars": 120, "content_timeout_ms": 300
+        })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+    let results = r.json["results"].as_array().unwrap();
+    let content = results[0]["content"].as_str().unwrap();
+    assert!(
+        content.chars().count() <= 120 && content.ends_with("word"),
+        "{content:?}"
+    );
+    assert!(results[1].get("content").is_none());
+    assert!(results[1]["content_error"].as_str().unwrap().contains("timed out"));
+
+    // Different content settings = new search, but page text comes from the content cache.
+    let r = call(
+        &app,
+        post(json!({"query": "deadline", "engine": "mojeek", "include_content": true, "content_limit": 1})),
+    )
+    .await;
+    assert!(r.json["results"][0]["content"].as_str().unwrap().len() > 120);
+}
+
+#[tokio::test]
+async fn fresh_bypasses_the_cache() {
+    let mock = MockServer::start().await;
+    mojeek()
+        .respond_with(html(mojeek_page(&mock.uri(), "fresh", 1, 2)))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let app = app(config(&mock));
+    assert_eq!(
+        call(&app, get("/v1/search?q=fresh&engine=mojeek")).await.json["cached"],
+        false
+    );
+    let r = call(&app, get("/v1/search?q=fresh&engine=mojeek&fresh=true")).await;
+    assert_eq!(r.json["cached"], false);
+    assert_eq!(
+        call(&app, get("/v1/search?q=fresh&engine=mojeek")).await.json["cached"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn validates_new_params() {
+    let mock = MockServer::start().await;
+    let app = app(config(&mock));
+    for (uri, needle) in [
+        ("/v1/search?q=x&engine=bing&engines=brave", "conflicts"),
+        ("/v1/search?q=x&engine=bing&strategy=merge", "strategy"),
+        ("/v1/search?q=x&strategy=parallel", "strategy"),
+        ("/v1/search?q=x&time_range=decade", "time_range"),
+        ("/v1/search?q=x&engines=bing,altavista", "unknown engine"),
+        ("/v1/search?q=x&include_domains=localhost", "invalid domain"),
+        ("/v1/search?q=x&file_type=../etc", "file_type"),
+        (
+            "/v1/search?q=x&include_content=true&content_timeout_ms=5",
+            "content_timeout_ms",
+        ),
+        (
+            "/v1/search?q=x&include_content=true&content_max_chars=999999",
+            "content_max_chars",
+        ),
+    ] {
+        let r = call(&app, get(uri)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.json);
+        let msg = r.json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(needle), "{uri}: `{msg}` should mention `{needle}`");
+    }
+}

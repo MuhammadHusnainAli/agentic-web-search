@@ -115,6 +115,51 @@ pub enum SafeSearch {
     Strict,
 }
 
+/// Restrict results to pages published within a recent window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeRange {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl TimeRange {
+    /// Single-letter code used by Google (`qdr:`), DuckDuckGo (`df`) and Yahoo (`btf`).
+    pub const fn letter(self) -> &'static str {
+        match self {
+            TimeRange::Day => "d",
+            TimeRange::Week => "w",
+            TimeRange::Month => "m",
+            TimeRange::Year => "y",
+        }
+    }
+
+    pub const fn days(self) -> u64 {
+        match self {
+            TimeRange::Day => 1,
+            TimeRange::Week => 7,
+            TimeRange::Month => 31,
+            TimeRange::Year => 365,
+        }
+    }
+}
+
+/// How `engine=auto` combines engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Strategy {
+    /// Walk the chain in order, starting the next engine early (hedging) when
+    /// the current one is slow. First engine with results wins.
+    #[default]
+    Fallback,
+    /// Query every engine at once; the first one with results wins.
+    Race,
+    /// Query every engine at once and fuse their rankings (meta-search).
+    Merge,
+}
+
 /// A `<country>-<language>` region such as `us-en`, `de-de`, `gb-en`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Region {
@@ -204,9 +249,15 @@ pub struct SearchResult {
     pub url: String,
     pub domain: String,
     pub snippet: String,
+    /// Every engine that returned this URL (only with `strategy=merge`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<EngineKind>,
     /// Extracted readable text of the target page (only with `include_content`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Why `content` is missing for a result that was supposed to get it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_error: Option<String>,
 }
 
 #[cfg(test)]

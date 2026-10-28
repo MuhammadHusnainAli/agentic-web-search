@@ -55,6 +55,9 @@ impl DuckDuckGo {
                 .to_owned(),
             ),
         ];
+        if let Some(t) = q.time_range {
+            p.push(("df", t.letter().to_owned()));
+        }
         if offset > 0 {
             // Mirrors the hidden fields of DDG's own "Next" form.
             p.push(("s", offset.to_string()));
@@ -169,11 +172,13 @@ mod tests {
             page: 2,
             region: Default::default(),
             safe: SafeSearch::Strict,
+            time_range: Some(crate::model::TimeRange::Week),
         };
         let p = DuckDuckGo::params(&q);
         assert!(p.contains(&("s", "20".into())));
         assert!(p.contains(&("dc", "21".into())));
         assert!(p.contains(&("kp", "1".into())));
         assert!(p.contains(&("kl", "us-en".into())));
+        assert!(p.contains(&("df", "w".into())));
     }
 }

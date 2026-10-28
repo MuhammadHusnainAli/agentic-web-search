@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::{
     config::Config,
-    model::{EngineKind, RawResult, Region, SafeSearch},
+    model::{EngineKind, RawResult, Region, SafeSearch, TimeRange},
 };
 
 /// Parameters for fetching a single SERP page.
@@ -34,6 +34,7 @@ pub struct PageQuery<'a> {
     pub page: u32,
     pub region: Region,
     pub safe: SafeSearch,
+    pub time_range: Option<TimeRange>,
 }
 
 /// A fully described upstream HTTP request. `POST` with a form body when `form` is set.
@@ -78,6 +79,11 @@ pub trait Engine: Send + Sync + 'static {
     /// `true` when the plain-HTTP SERP is unusable without JavaScript.
     fn requires_js(&self) -> bool {
         false
+    }
+
+    /// Whether the engine can filter by `range` natively.
+    fn supports_time_range(&self, _range: TimeRange) -> bool {
+        true
     }
 
     /// Detect CAPTCHA / bot-challenge / JS-wall responses.
@@ -145,6 +151,7 @@ mod tests {
             page: 1,
             region: Region::DEFAULT,
             safe: SafeSearch::Moderate,
+            time_range: None,
         };
         let req = engines.get(EngineKind::Bing).http_request(&q);
         assert!(req.url.as_str().starts_with("http://127.0.0.1:9999/search?"));

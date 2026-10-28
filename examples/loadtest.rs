@@ -6,11 +6,17 @@
 //! ```
 //!
 //! Reports throughput, status codes and latency percentiles.
+//!
+//! A `{n}` in the URL is replaced by a unique counter per request, so every
+//! request misses the cache (e.g. `?q=rust+{n}`).
 
 use std::{
     collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn arg(i: usize) -> Option<String> {
     std::env::args().nth(i)
@@ -43,8 +49,13 @@ async fn main() {
             let mut codes: BTreeMap<u16, u64> = BTreeMap::new();
             let mut errors = 0u64;
             while Instant::now() < deadline {
+                let target = if url.contains("{n}") {
+                    url.replace("{n}", &SEQ.fetch_add(1, Ordering::Relaxed).to_string())
+                } else {
+                    url.clone()
+                };
                 let t = Instant::now();
-                match client.get(&url).header("x-api-key", &key).send().await {
+                match client.get(&target).header("x-api-key", &key).send().await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         let _ = resp.bytes().await;

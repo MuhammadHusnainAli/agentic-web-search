@@ -8,7 +8,7 @@ use super::{
     Engine, PageQuery, UpstreamRequest,
     util::{absolute_http, first_text, generic_block, sel, text},
 };
-use crate::model::{EngineKind, RawResult, SafeSearch};
+use crate::model::{EngineKind, RawResult, SafeSearch, TimeRange};
 
 /// Yahoo renders 7 organic results per page.
 const PER_PAGE: u32 = 7;
@@ -39,9 +39,13 @@ impl Yahoo {
     }
 }
 
-/// Yahoo wraps links as `https://r.search.yahoo.com/.../RU=<pct-encoded>/RK=.../RS=...`.
+/// Yahoo wraps links as `https://r.search.yahoo.com/.../RU=<pct-encoded>/RK=.../RS=...`
+/// (`rd.search.yahoo.com` for sponsored clicks). Any other Yahoo-hosted link
+/// is internal navigation or an ad, never an organic result.
 fn unwrap_link(url: Url) -> Option<Url> {
-    if !url.host_str().is_some_and(|h| h.starts_with("r.search.yahoo.")) {
+    let host = url.host_str().unwrap_or_default();
+    let is_yahoo = host == "yahoo.com" || host.ends_with(".yahoo.com") || host.contains(".yahoo.");
+    if !is_yahoo {
         return Some(url);
     }
     let path = url.path();
@@ -72,11 +76,19 @@ impl Engine for Yahoo {
                         SafeSearch::Strict => "r",
                     },
                 );
+            if let Some(t) = q.time_range.filter(|t| self.supports_time_range(*t)) {
+                p.append_pair("btf", t.letter());
+            }
             if q.page > 0 {
                 p.append_pair("b", &(q.page * PER_PAGE + 1).to_string());
             }
         }
         UpstreamRequest::get(url)
+    }
+
+    /// Yahoo's `btf` filter only offers day / week / month.
+    fn supports_time_range(&self, range: TimeRange) -> bool {
+        range != TimeRange::Year
     }
 
     fn ready_selector(&self) -> &'static str {
@@ -122,5 +134,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unwrap_link(u).unwrap().as_str(), "https://www.rust-lang.org/");
+        let rd = Url::parse("https://rd.search.yahoo.com/_ylt=x/RV=2/RU=https%3a%2f%2ftokio.rs%2f/RK=0/RS=y").unwrap();
+        assert_eq!(unwrap_link(rd).unwrap().as_str(), "https://tokio.rs/");
+        // Unwrappable Yahoo links (ad clicks, internal pages) are dropped.
+        let ad = Url::parse("https://rd.search.yahoo.com/_ylc=abc/cbclk2/*https://ads.example").unwrap();
+        assert!(unwrap_link(ad).is_none());
+        assert!(unwrap_link(Url::parse("https://search.yahoo.com/search?p=x").unwrap()).is_none());
+        assert!(unwrap_link(Url::parse("https://docs.rs/").unwrap()).is_some());
     }
 }

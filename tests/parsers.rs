@@ -3,7 +3,7 @@
 use agentic_web_search::{
     Config,
     engines::{Engines, PageQuery},
-    model::{EngineKind, RawResult, Region, SafeSearch},
+    model::{EngineKind, RawResult, Region, SafeSearch, TimeRange},
 };
 
 fn fixture(name: &str) -> String {
@@ -112,6 +112,7 @@ fn every_engine_builds_paginated_requests() {
             page,
             region: Region::DEFAULT,
             safe: SafeSearch::Moderate,
+            time_range: None,
         };
         let (first, second) = (e.http_request(&q(0)), e.http_request(&q(1)));
         assert_ne!(
@@ -129,4 +130,46 @@ fn every_engine_builds_paginated_requests() {
         assert!(page1.as_str().contains("rust+%26+tokio"), "{kind}: {page1}");
         assert!(!e.ready_selector().is_empty());
     }
+}
+
+#[test]
+fn time_range_maps_to_each_engines_native_filter() {
+    let engines = Engines::new(&Config::default());
+    let expect = [
+        (EngineKind::Google, TimeRange::Week, "tbs=qdr%3Aw"),
+        (EngineKind::Bing, TimeRange::Day, "filters=ex1%3A%22ez1%22"),
+        (EngineKind::Bing, TimeRange::Year, "ez5_"),
+        (EngineKind::Brave, TimeRange::Month, "tf=pm"),
+        (EngineKind::Yahoo, TimeRange::Day, "btf=d"),
+    ];
+    for (kind, range, needle) in expect {
+        let q = PageQuery {
+            query: "rust",
+            page: 0,
+            region: Region::DEFAULT,
+            safe: SafeSearch::Moderate,
+            time_range: Some(range),
+        };
+        let url = engines.get(kind).http_request(&q).url;
+        assert!(url.as_str().contains(needle), "{kind}/{range:?}: {url}");
+    }
+    let q = PageQuery {
+        query: "rust",
+        page: 0,
+        region: Region::DEFAULT,
+        safe: SafeSearch::Moderate,
+        time_range: Some(TimeRange::Year),
+    };
+    let ddg = engines.get(EngineKind::DuckDuckGo).http_request(&q);
+    assert!(ddg.form.unwrap().contains(&("df", "y".into())));
+    // Unsupported ranges are left out rather than sent as garbage.
+    assert!(
+        !engines
+            .get(EngineKind::Yahoo)
+            .http_request(&q)
+            .url
+            .as_str()
+            .contains("btf")
+    );
+    assert!(!engines.get(EngineKind::Mojeek).supports_time_range(TimeRange::Day));
 }
