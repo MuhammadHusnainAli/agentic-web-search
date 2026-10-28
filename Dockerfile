@@ -11,6 +11,9 @@
 # `src/` only recompiles this crate.
 
 ARG RUST_VERSION=1
+# `release` (fat LTO, for published images) or `ci` (no LTO, ~8x faster
+# rebuilds, for CI smoke tests). The binary lands in target/<profile>/.
+ARG CARGO_PROFILE=release
 
 # ---------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-slim-bookworm AS build-base
@@ -22,18 +25,20 @@ RUN mkdir -p src/app examples \
     && echo 'fn main() {}' > examples/loadtest.rs
 
 FROM build-base AS build-full
-RUN cargo build --release --locked
+ARG CARGO_PROFILE
+RUN cargo build --profile ${CARGO_PROFILE} --locked
 COPY src ./src
 RUN touch src/lib.rs src/app/main.rs \
-    && cargo build --release --locked \
-    && cp target/release/agentic-web-search /agentic-web-search
+    && cargo build --profile ${CARGO_PROFILE} --locked \
+    && cp target/${CARGO_PROFILE}/agentic-web-search /agentic-web-search
 
 FROM build-base AS build-lite
-RUN cargo build --release --locked --no-default-features
+ARG CARGO_PROFILE
+RUN cargo build --profile ${CARGO_PROFILE} --locked --no-default-features
 COPY src ./src
 RUN touch src/lib.rs src/app/main.rs \
-    && cargo build --release --locked --no-default-features \
-    && cp target/release/agentic-web-search /agentic-web-search
+    && cargo build --profile ${CARGO_PROFILE} --locked --no-default-features \
+    && cp target/${CARGO_PROFILE}/agentic-web-search /agentic-web-search
 
 # ---------------------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot AS lite

@@ -63,6 +63,26 @@ strip = "symbols"
 debug = false
 incremental = false
 
-# Fast-ish dev builds while keeping heavy deps optimized (HTML parsing in tests).
-[profile.dev.package."*"]
+# Fast builds for CI smoke-test images: fat LTO + 1 codegen unit re-optimise the
+# whole dependency graph on every build (minutes on a 4-core runner) for a few
+# percent of runtime speed nobody needs in a throwaway image.
+# `docker build --build-arg CARGO_PROFILE=ci`.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+# Optimise only the HTML-parsing crates in dev builds (they dominate test
+# runtime); optimising every dependency made each cold CI build much slower.
+[profile.dev.package.scraper]
+opt-level = 2
+[profile.dev.package.html5ever]
+opt-level = 2
+[profile.dev.package.markup5ever]
+opt-level = 2
+[profile.dev.package.selectors]
+opt-level = 2
+[profile.dev.package.cssparser]
+opt-level = 2
+[profile.dev.package.ego-tree]
 opt-level = 2
