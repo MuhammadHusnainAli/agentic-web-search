@@ -107,7 +107,10 @@ Build without the browser (smaller binary, no Chromium needed):
 GET uses the same fields as query parameters, with lists comma-separated:
 `/v1/search?q=rust&engines=bing,brave&strategy=merge&time_range=month&site=docs.rs`.
 
-Each result has `position`, `page`, `engine`, `title`, `url`, `domain` and `snippet`. It can also have
+Each result has `position`, `page`, `engine`, `title`, `url`, `domain`, `snippet` and `score`.
+`score` is a rank-fusion relevance in (0, 1]. 1.0 means ranked first by every engine that returned results.
+With `strategy=merge` over two engines, a URL only one of them found scores at most 0.5, so
+`score > 0.5` keeps the results the engines agree on. It can also have
 `engines` (merge only: every engine that returned the URL), `content`, and `content_error`.
 With `include_content`, fetched pages also get `metadata`:
 

@@ -303,11 +303,13 @@ impl SearchService {
             failures.append(&mut run.failures);
         }
 
-        let mut results = if runs.len() == 1 {
-            std::mem::take(&mut runs[0].results)
-        } else {
-            fuse(&mut runs)
-        };
+        // Scored from the engines' own ranks, before trimming, so `unique_domains`
+        // and `max_results` never change a result's score.
+        let mut results = fuse(&mut runs);
+        let best = engines_used.len() as f64 / (RRF_K + 1.0);
+        for r in &mut results {
+            r.score = (r.score / best * 1e4).round() / 1e4;
+        }
         if req.unique_domains {
             let mut seen = HashSet::new();
             results.retain(|r| seen.insert(r.domain.clone()));
@@ -590,6 +592,7 @@ impl SearchService {
                             title: r.title,
                             url: r.url,
                             snippet: r.snippet,
+                            score: 0.0,
                             engines: Vec::new(),
                             content: None,
                             metadata: None,
@@ -841,17 +844,20 @@ impl SearchService {
 /// Reciprocal-rank fusion of several engines' rankings: a URL scores
 /// `Σ 1/(60 + rank)` over the engines that returned it, so agreement between
 /// engines beats a single high placement. Keeps the longest snippet.
+/// Reciprocal-rank-fusion constant: dampens the gap between neighbouring ranks.
+const RRF_K: f64 = 60.0;
+
 fn fuse(runs: &mut [EngineRun]) -> Vec<SearchResult> {
-    const K: f64 = 60.0;
+    let single = runs.len() == 1;
     let mut index: HashMap<String, usize> = HashMap::new();
-    let mut merged: Vec<(f64, SearchResult)> = Vec::new();
+    let mut merged: Vec<SearchResult> = Vec::new();
     for run in runs.iter_mut() {
         for (rank, mut r) in run.results.drain(..).enumerate() {
-            let score = 1.0 / (K + rank as f64 + 1.0);
+            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
             match index.entry(dedupe_key(&r.url)) {
                 Entry::Occupied(e) => {
-                    let (s, m) = &mut merged[*e.get()];
-                    *s += score;
+                    let m = &mut merged[*e.get()];
+                    m.score += score;
                     m.engines.push(r.engine);
                     if r.snippet.len() > m.snippet.len() {
                         m.snippet = r.snippet;
@@ -859,15 +865,19 @@ fn fuse(runs: &mut [EngineRun]) -> Vec<SearchResult> {
                 }
                 Entry::Vacant(e) => {
                     e.insert(merged.len());
-                    r.engines = vec![r.engine];
-                    merged.push((score, r));
+                    r.score = score;
+                    // `engines` is only reported when several engines were fused.
+                    if !single {
+                        r.engines = vec![r.engine];
+                    }
+                    merged.push(r);
                 }
             }
         }
     }
-    // Stable: equal scores keep chain priority.
-    merged.sort_by(|a, b| b.0.total_cmp(&a.0));
-    merged.into_iter().map(|(_, r)| r).collect()
+    // Stable: equal scores keep chain priority (and a single engine's order).
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score));
+    merged
 }
 
 /// Words too common to signal relevance.
@@ -1100,6 +1110,7 @@ mod tests {
             url: url.into(),
             domain: domain_of(url),
             snippet: snippet.into(),
+            score: 0.0,
             engines: Vec::new(),
             content: None,
             metadata: None,
@@ -1125,6 +1136,17 @@ mod tests {
         assert_eq!(fused[0].engines, [EngineKind::Bing, EngineKind::Brave]);
         assert_eq!(fused[0].snippet, "longer b snippet");
         assert_eq!(fused[1].engines, [EngineKind::Bing]);
+        assert!(fused[0].score > fused[1].score && fused[1].score > fused[2].score);
+
+        // A single engine keeps its order and reports no `engines` list.
+        let mut one = [run(
+            EngineKind::Bing,
+            &[("https://a.com/", "a"), ("https://b.com/", "b")],
+        )];
+        let fused = fuse(&mut one);
+        assert_eq!(fused[0].domain, "a.com");
+        assert!(fused[0].engines.is_empty());
+        assert!((fused[0].score - 1.0 / 61.0).abs() < 1e-12);
     }
 
     #[test]

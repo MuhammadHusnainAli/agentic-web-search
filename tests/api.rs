@@ -140,10 +140,15 @@ async fn bing_search_returns_structured_results_and_caches() {
     assert_eq!(r.headers["x-cache"], "MISS");
     let results = r.json["results"].as_array().unwrap();
     assert!(results.len() >= 8);
+    assert_eq!(results[0]["score"], 1.0);
     for (i, res) in results.iter().enumerate() {
         assert_eq!(res["position"], i + 1);
         assert_eq!(res["page"], 1);
         assert_eq!(res["engine"], "bing");
+        assert!(res.get("engines").is_none(), "single engine: no engines list");
+        if i > 0 {
+            assert!(res["score"].as_f64().unwrap() < results[i - 1]["score"].as_f64().unwrap());
+        }
         assert!(res["url"].as_str().unwrap().starts_with("http"));
         assert!(!res["domain"].as_str().unwrap().is_empty());
         assert!(res.get("content").is_none());
@@ -618,8 +623,13 @@ async fn merge_fuses_engines_and_drops_stragglers() {
     assert_eq!(results.len(), 4, "shared URL de-duplicated");
     assert_eq!(results[0]["url"], shared, "URL both engines agree on ranks first");
     assert_eq!(results[0]["engines"], json!(["bing", "mojeek"]));
+    // Both engines ranked it 2nd: (1/62 + 1/62) / (2/61).
+    assert_eq!(results[0]["score"], 0.9839);
     for (i, res) in results.iter().enumerate() {
         assert_eq!(res["position"], i + 1);
+        if i > 0 {
+            assert!(res["score"].as_f64().unwrap() <= 0.5, "found by one engine: {res}");
+        }
     }
     let errors = r.json["errors"].as_array().unwrap();
     assert!(
@@ -682,6 +692,9 @@ async fn domain_and_file_type_filters() {
     let results = r.json["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[1]["position"], 2);
+    // Scores come from the engine's ranks before de-duplication by domain:
+    // docs.b.org was 4th on the SERP (3rd after domain filtering).
+    assert_eq!(results[1]["score"], (61.0f64 / 63.0 * 1e4).round() / 1e4);
 }
 
 #[tokio::test]

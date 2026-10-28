@@ -323,6 +323,10 @@ pub struct SearchResult {
     pub url: String,
     pub domain: String,
     pub snippet: String,
+    /// Rank-fusion relevance in (0, 1]: 1.0 = ranked first by every engine
+    /// that returned results; a URL only one of two merged engines found
+    /// scores at most 0.5.
+    pub score: f64,
     /// Every engine that returned this URL (only with `strategy=merge`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engines: Vec<EngineKind>,
