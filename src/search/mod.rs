@@ -26,7 +26,10 @@ use crate::{
     error::{AppError, EngineFailure, UpstreamError},
     fetch::{BrowserPool, HttpFetcher},
     metrics::Metrics,
-    model::{EngineChoice, EngineKind, FetchMode, RawResult, Region, SafeSearch, SearchResult, Strategy, TimeRange},
+    model::{
+        ContentFormat, EngineChoice, EngineKind, FetchMode, RawResult, Region, SafeSearch, SearchResult, Strategy,
+        TimeRange,
+    },
 };
 
 /// A validated search request. Also the cache key.
@@ -50,6 +53,7 @@ pub struct SearchRequest {
     pub max_results: Option<u32>,
     pub include_content: bool,
     pub content_limit: u32,
+    pub content_format: ContentFormat,
     pub content_max_chars: u32,
     pub content_timeout_ms: u32,
 }
@@ -137,8 +141,8 @@ pub struct SearchService {
     http: HttpFetcher,
     browser: Arc<BrowserPool>,
     cache: Cache<SearchRequest, Arc<SearchOutput>>,
-    /// Extracted page text by URL, shared across searches.
-    content_cache: Cache<String, Arc<str>>,
+    /// Extracted pages by URL, shared across searches.
+    content_cache: Cache<String, Arc<content::Page>>,
     upstream: Semaphore,
     content_permits: Semaphore,
     /// Caps CPU-bound extraction at the core count: more parse threads than
@@ -172,7 +176,7 @@ impl SearchService {
             .build();
         let content_cache = Cache::builder()
             .max_capacity(cfg.content_cache_max_bytes)
-            .weigher(|k: &String, v: &Arc<str>| u32::try_from(k.len() + v.len() + 64).unwrap_or(u32::MAX))
+            .weigher(|k: &String, v: &Arc<content::Page>| u32::try_from(k.len() + v.weight()).unwrap_or(u32::MAX))
             .time_to_live(cfg.cache_ttl)
             .build();
         Ok(Self {
@@ -657,7 +661,7 @@ impl SearchService {
     /// within the request's content deadline; slower pages get `content_error`.
     async fn attach_content(&self, results: &mut [SearchResult], req: &SearchRequest) {
         let limit = req.content_limit as usize;
-        let max_chars = req.content_max_chars as usize;
+        let (format, max_chars) = (req.content_format, req.content_max_chars as usize);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(req.content_timeout_ms));
         let targets: Vec<(usize, String)> = results
             .iter()
@@ -667,8 +671,8 @@ impl SearchService {
             .collect();
         let fetched: Vec<(usize, Result<String, String>)> = stream::iter(targets)
             .map(|(i, url)| async move {
-                let text = match tokio::time::timeout_at(deadline, self.page_text(&url)).await {
-                    Ok(Ok(text)) => Ok(truncate_text(&text, max_chars).to_owned()),
+                let text = match tokio::time::timeout_at(deadline, self.page(&url)).await {
+                    Ok(Ok(page)) => Ok(page.render(format, max_chars).0),
                     Ok(Err(e)) => {
                         tracing::debug!(%url, error = %e, "content fetch failed");
                         Err(e)
@@ -692,10 +696,10 @@ impl SearchService {
         }
     }
 
-    /// Readable text of `url` (up to `CONTENT_MAX_CHARS`), cached and coalesced
-    /// across searches. Parsing runs on the blocking pool so large pages never
-    /// stall the async workers.
-    async fn page_text(&self, url: &str) -> Result<Arc<str>, String> {
+    /// Readable content of `url` (up to `CONTENT_MAX_CHARS`), cached and
+    /// coalesced across searches. Parsing runs on the blocking pool so large
+    /// pages never stall the async workers.
+    async fn page(&self, url: &str) -> Result<Arc<content::Page>, String> {
         self.content_cache
             .try_get_with_by_ref(url, async {
                 let _permit = self.content_permits.acquire().await.expect("semaphore never closed");
@@ -712,10 +716,10 @@ impl SearchService {
                 }
                 let max = self.cfg.content_max_chars;
                 let _parse = self.parse_permits.acquire().await.expect("semaphore never closed");
-                let text = tokio::task::spawn_blocking(move || content::extract_text(&doc.body, max))
+                let page = tokio::task::spawn_blocking(move || content::extract(&doc.body, Some(&doc.url), max))
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(Arc::from(text))
+                Ok(Arc::new(page))
             })
             .await
             .map_err(|e: Arc<String>| (*e).clone())
@@ -752,18 +756,6 @@ fn fuse(runs: &mut [EngineRun]) -> Vec<SearchResult> {
     // Stable: equal scores keep chain priority.
     merged.sort_by(|a, b| b.0.total_cmp(&a.0));
     merged.into_iter().map(|(_, r)| r).collect()
-}
-
-/// At most `max` characters of `text`, cut at a word boundary when possible.
-fn truncate_text(text: &str, max: usize) -> &str {
-    let Some((cut, _)) = text.char_indices().nth(max) else {
-        return text;
-    };
-    let head = &text[..cut];
-    match head.rfind(char::is_whitespace) {
-        Some(ws) if ws > cut / 2 => head[..ws].trim_end(),
-        _ => head,
-    }
 }
 
 /// Words too common to signal relevance.
@@ -917,6 +909,7 @@ mod tests {
             max_results: None,
             include_content: false,
             content_limit: 0,
+            content_format: ContentFormat::Markdown,
             content_max_chars: 0,
             content_timeout_ms: 0,
         }
@@ -984,14 +977,6 @@ mod tests {
         assert_eq!(fused[0].engines, [EngineKind::Bing, EngineKind::Brave]);
         assert_eq!(fused[0].snippet, "longer b snippet");
         assert_eq!(fused[1].engines, [EngineKind::Bing]);
-    }
-
-    #[test]
-    fn truncates_on_word_boundaries() {
-        assert_eq!(truncate_text("short", 10), "short");
-        assert_eq!(truncate_text("hello brave new world", 13), "hello brave");
-        assert_eq!(truncate_text("héllo wörld", 7), "héllo");
-        assert_eq!(truncate_text("abcdefghij", 4), "abcd");
     }
 
     #[test]

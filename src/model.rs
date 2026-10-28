@@ -146,6 +146,17 @@ impl TimeRange {
     }
 }
 
+/// How extracted page content is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentFormat {
+    /// Headings, lists, code blocks, tables and links, as Markdown.
+    #[default]
+    Markdown,
+    /// Plain text, one block per line.
+    Text,
+}
+
 /// How `engine=auto` combines engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

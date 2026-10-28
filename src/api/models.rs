@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     config::Config,
     error::{AppError, EngineFailure},
-    model::{EngineChoice, EngineKind, FetchMode, Region, SafeSearch, Strategy, TimeRange},
+    model::{ContentFormat, EngineChoice, EngineKind, FetchMode, Region, SafeSearch, Strategy, TimeRange},
     search::SearchRequest,
 };
 
@@ -54,6 +54,8 @@ pub struct SearchParams {
     pub include_content: Option<bool>,
     /// How many top results get `content` extracted (default 3).
     pub content_limit: Option<u32>,
+    /// markdown (default) | text
+    pub content_format: Option<ContentFormat>,
     /// Max characters of `content` per result (default and cap: `CONTENT_MAX_CHARS`).
     pub content_max_chars: Option<u32>,
     /// Deadline for content extraction; slower pages come back without `content`.
@@ -245,6 +247,11 @@ impl SearchParams {
             include_content,
             // Normalise so content knobs don't fragment the cache when content is off.
             content_limit: if include_content { content_limit } else { 0 },
+            content_format: if include_content {
+                self.content_format.unwrap_or_default()
+            } else {
+                ContentFormat::default()
+            },
             content_max_chars: if include_content { content_max_chars } else { 0 },
             content_timeout_ms: if include_content { content_timeout_ms } else { 0 },
         })
@@ -301,6 +308,7 @@ mod tests {
             max_results: None,
             include_content: None,
             content_limit: None,
+            content_format: None,
             content_max_chars: None,
             content_timeout_ms: None,
             fresh: None,

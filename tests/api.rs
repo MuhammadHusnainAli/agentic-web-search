@@ -355,9 +355,22 @@ async fn include_content_extracts_page_text() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.json);
     let results = r.json["results"].as_array().unwrap();
-    assert_eq!(results[0]["content"], "Doc one\nBody text.");
+    assert_eq!(
+        results[0]["content"], "# Doc one\n\nBody text.",
+        "markdown is the default"
+    );
     assert!(results[1].get("content").is_none(), "non-HTML must be skipped");
     assert!(results[2].get("content").is_none(), "beyond content_limit");
+
+    let r = call(
+        &app,
+        post(json!({
+            "query": "content", "engine": "mojeek", "include_content": true,
+            "content_limit": 1, "content_format": "text"
+        })),
+    )
+    .await;
+    assert_eq!(r.json["results"][0]["content"], "Doc one\nBody text.");
 }
 
 #[tokio::test]

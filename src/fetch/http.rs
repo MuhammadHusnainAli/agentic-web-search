@@ -19,6 +19,8 @@ use crate::{config::Config, engines::UpstreamRequest, error::UpstreamError, mode
 /// A fetched, size-capped, UTF-8 decoded document.
 #[derive(Debug)]
 pub struct Fetched {
+    /// Final URL after redirects.
+    pub url: Url,
     pub status: u16,
     pub body: String,
     pub content_type: Option<String>,
@@ -211,6 +213,7 @@ impl HttpFetcher {
 /// Stream the body into memory, stopping at `max` bytes so a huge or hostile
 /// response can never balloon memory.
 async fn read_capped(mut resp: Response, max: usize) -> Result<Fetched, reqwest::Error> {
+    let url = resp.url().clone();
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -233,6 +236,7 @@ async fn read_capped(mut resp: Response, max: usize) -> Result<Fetched, reqwest:
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
     Ok(Fetched {
+        url,
         status,
         body,
         content_type,
