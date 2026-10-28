@@ -151,7 +151,7 @@ pub struct SearchService {
     content_permits: Semaphore,
     /// Caps CPU-bound extraction at the core count: more parse threads than
     /// cores adds no throughput, only per-thread allocator heaps.
-    parse_permits: Semaphore,
+    parse_permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     /// Per-engine "HTTP blocked until" timestamp, ms since `epoch`.
     http_blocked_until: [AtomicU64; EngineKind::ALL.len()],
@@ -191,7 +191,9 @@ impl SearchService {
             content_cache,
             upstream: Semaphore::new(cfg.max_upstream_concurrency),
             content_permits: Semaphore::new(cfg.content_max_concurrency),
-            parse_permits: Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get())),
+            parse_permits: Arc::new(Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |n| n.get()),
+            )),
             metrics,
             http_blocked_until: Default::default(),
             epoch: Instant::now(),
@@ -730,17 +732,44 @@ impl SearchService {
                 if doc.status >= 400 {
                     return Err(format!("HTTP {}", doc.status));
                 }
-                if !is_textual(doc.content_type.as_deref()) {
+                let pdf = doc.is_pdf();
+                if pdf && doc.truncated {
+                    return Err(format!(
+                        "PDF larger than {} MiB",
+                        self.cfg.content_max_pdf_bytes / (1024 * 1024)
+                    ));
+                }
+                if !pdf && !is_textual(doc.content_type.as_deref()) {
                     return Err(format!(
                         "unsupported content type {}",
                         doc.content_type.as_deref().unwrap_or_default()
                     ));
                 }
                 let max = self.cfg.content_max_chars;
-                let _parse = self.parse_permits.acquire().await.expect("semaphore never closed");
-                let page = tokio::task::spawn_blocking(move || content::extract(&doc.body, Some(&doc.url), max))
+                // The permit moves into the blocking task: if this search times
+                // out, the parse still finishes before its core is handed back.
+                let permit = self
+                    .parse_permits
+                    .clone()
+                    .acquire_owned()
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .expect("semaphore never closed");
+                let page = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    if pdf {
+                        content::extract_pdf(&doc.bytes, &doc.url, max)
+                    } else {
+                        Ok(content::extract(&doc.text(), Some(&doc.url), max))
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    if e.is_panic() {
+                        "page could not be parsed".to_owned()
+                    } else {
+                        e.to_string()
+                    }
+                })??;
                 Ok(Arc::new(page))
             })
             .await

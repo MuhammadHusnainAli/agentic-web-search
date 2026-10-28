@@ -119,6 +119,10 @@ With `include_content`, fetched pages also get `metadata`:
 ```
 
 These come from `<title>`, meta/OpenGraph tags, JSON-LD, `<time>` and `<html lang>`. Missing fields are omitted.
+
+**PDF results** are extracted too: text page by page (stopping at the character budget), with `title`, `author`
+and `published` from the PDF's Info dictionary. PDFs larger than `CONTENT_MAX_PDF_MB` (10) get a `content_error`.
+Big PDFs on slow hosts may need a longer `content_timeout_ms` (up to 30,000).
 The response also lists `engines_used`, and adds `warnings` when an engine can't apply a filter.
 
 ### Latency

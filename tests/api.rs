@@ -901,3 +901,49 @@ async fn content_comes_with_page_metadata() {
     assert!(failed.get("metadata").is_none());
     assert_eq!(failed["content_error"], "HTTP 404");
 }
+
+#[tokio::test]
+async fn pdf_results_get_text_content() {
+    let mock = MockServer::start().await;
+    let base = mock.uri();
+    mojeek()
+        .respond_with(html(mojeek_page(&base, "tokio report", 1, 3)))
+        .mount(&mock)
+        .await;
+    let pdf = std::fs::read(format!("{}/tests/fixtures/sample.pdf", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    Mock::given(path("/doc/1/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(pdf.clone(), "application/pdf"))
+        .mount(&mock)
+        .await;
+    Mock::given(path("/doc/1/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"%PDF-1.7 not really".to_vec(), "application/pdf"))
+        .mount(&mock)
+        .await;
+    let mut big = pdf.clone();
+    big.resize(2 * 1024 * 1024, b' ');
+    Mock::given(path("/doc/1/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(big, "application/pdf"))
+        .mount(&mock)
+        .await;
+    let mut cfg = config(&mock);
+    cfg.content_max_pdf_bytes = 1024 * 1024;
+    let app = app(cfg);
+    let r = call(
+        &app,
+        post(json!({"query": "tokio report", "engine": "mojeek", "include_content": true, "content_limit": 3})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let res = r.json["results"].as_array().unwrap();
+    let content = res[0]["content"].as_str().unwrap();
+    assert!(content.starts_with("Tokio Runtime Report"), "{content}");
+    assert!(content.contains("Benchmarks were run on twelve cores."));
+    assert_eq!(res[0]["metadata"]["title"], "Tokio Runtime Report");
+    assert_eq!(res[0]["metadata"]["author"], "Jane Doe");
+    assert!(
+        res[1]["content_error"].as_str().unwrap().contains("unreadable PDF"),
+        "{}",
+        res[1]
+    );
+    assert_eq!(res[2]["content_error"], "PDF larger than 1 MiB");
+}

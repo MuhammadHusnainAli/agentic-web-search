@@ -879,6 +879,129 @@ fn metadata(doc: &Html, base: Option<&Url>) -> PageMetadata {
     }
 }
 
+/// Decode a PDF text string: UTF-16BE with a BOM, else (approximately) Latin-1.
+fn pdf_string(bytes: &[u8]) -> String {
+    match bytes.strip_prefix(&[0xFE, 0xFF]) {
+        Some(utf16) => {
+            let units: Vec<u16> = utf16
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        None => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// `Title` / `Author` / `CreationDate` of the PDF's Info dictionary.
+fn pdf_info(doc: &pdf_extract::Document) -> (Option<String>, Option<String>, Option<String>) {
+    use pdf_extract::Object;
+    let info = match doc.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) => doc.get_object(*id).ok().and_then(|o| o.as_dict().ok()),
+        Ok(Object::Dictionary(d)) => Some(d),
+        _ => None,
+    };
+    let field = |key: &[u8]| match info?.get(key) {
+        Ok(Object::String(s, _)) => clean(&pdf_string(s), 300),
+        _ => None,
+    };
+    // `D:20240305101500Z` → `2024-03-05`
+    let date = field(b"CreationDate").and_then(|d| {
+        let d = d.strip_prefix("D:").unwrap_or(&d);
+        let b = d.as_bytes();
+        (b.len() >= 8 && b[..8].iter().all(u8::is_ascii_digit))
+            .then(|| format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]))
+    });
+    (field(b"Title"), field(b"Author"), date)
+}
+
+/// Turn the line-wrapped text of one PDF page into paragraphs: blank lines
+/// separate paragraphs and wrapped lines are re-joined. A line ending in `-`
+/// joins the next without a space but keeps the hyphen: a line-break hyphen
+/// can't be told from a compound (`work-` / `stealing`), and `exam-ple` reads
+/// better than `workstealing`.
+fn pdf_paragraphs(text: &str) -> Vec<String> {
+    let mut paras = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() {
+            if !cur.is_empty() {
+                paras.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let line = words.join(" ");
+        if !cur.is_empty() && !(cur.ends_with('-') && line.starts_with(|c: char| c.is_lowercase())) {
+            cur.push(' ');
+        }
+        cur.push_str(&line);
+    }
+    if !cur.is_empty() {
+        paras.push(cur);
+    }
+    paras
+}
+
+/// Extract the text of a PDF, page by page, stopping once `max_chars` are
+/// collected (so a 300-page report costs no more than its first pages). For a
+/// PDF cut at the limit, `word_count` covers the extracted part.
+///
+/// The PDF parser can panic on malformed files; callers run this on a
+/// blocking task, which turns a panic into an error.
+pub fn extract_pdf(bytes: &[u8], url: &Url, max_chars: usize) -> Result<Page, String> {
+    let mut doc = pdf_extract::Document::load_mem(bytes).map_err(|e| format!("unreadable PDF: {e}"))?;
+    if doc.is_encrypted() && doc.decrypt("").is_err() {
+        return Err("PDF is password-protected".into());
+    }
+    let (title, author, published) = pdf_info(&doc);
+    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+
+    let mut page = Page::default();
+    let mut chars = 0;
+    'pages: for (i, n) in pages.iter().enumerate() {
+        let mut text = String::new();
+        {
+            let mut out = pdf_extract::PlainTextOutput::new(&mut text);
+            if pdf_extract::output_doc_page(&doc, &mut out, *n).is_err() {
+                continue;
+            }
+        }
+        for para in pdf_paragraphs(&text) {
+            page.word_count += para.split_whitespace().count();
+            let len = para.chars().count();
+            if chars + len > max_chars {
+                let cut = truncate_text(&para, max_chars.saturating_sub(chars));
+                if !cut.is_empty() {
+                    page.blocks.push(Block {
+                        kind: BlockKind::Paragraph,
+                        text: cut.to_owned(),
+                        md: cut.to_owned(),
+                    });
+                }
+                page.truncated = true;
+                break 'pages;
+            }
+            chars += len;
+            page.blocks.push(Block {
+                kind: BlockKind::Paragraph,
+                md: para.clone(),
+                text: para,
+            });
+        }
+        page.truncated |= i + 1 < pages.len() && chars >= max_chars;
+    }
+    page.meta = PageMetadata {
+        title,
+        author,
+        published,
+        final_url: url.to_string(),
+        word_count: page.word_count,
+        ..PageMetadata::default()
+    };
+    Ok(page)
+}
+
 /// Extract the main readable content of `html`, keeping at most `max_chars`
 /// characters of text. Relative links resolve against `base`.
 pub fn extract(html: &str, base: Option<&Url>, max_chars: usize) -> Page {
@@ -1113,6 +1236,51 @@ mod tests {
             "junk meta date skipped for <time>"
         );
         assert!(m.description.is_none() && m.author.is_none() && m.language.is_none());
+    }
+
+    #[test]
+    fn rebuilds_pdf_paragraphs() {
+        let text = "Rust is a multi-  \nparadigm language\nfor systems.\n\n  Second   para.\n";
+        assert_eq!(
+            pdf_paragraphs(text),
+            ["Rust is a multi-paradigm language for systems.", "Second para."]
+        );
+        assert_eq!(pdf_paragraphs("Self-\nDriving cars"), ["Self- Driving cars"]);
+        assert_eq!(pdf_string(&[0xFE, 0xFF, 0, b'H', 0, b'i']), "Hi");
+        assert_eq!(pdf_string(b"caf\xe9"), "café");
+    }
+
+    #[test]
+    fn extracts_pdf_text_and_info() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.pdf")).unwrap();
+        let url = Url::parse("https://a.com/report.pdf").unwrap();
+        let page = extract_pdf(&bytes, &url, 10_000).unwrap();
+        let (text, truncated) = page.render(ContentFormat::Text, 10_000);
+        assert!(!truncated);
+        assert!(text.starts_with("Tokio Runtime Report"), "{text:?}");
+        assert!(
+            text.contains("worker threads using work-stealing queues."),
+            "wrapped lines re-joined: {text:?}"
+        );
+        assert!(
+            text.contains("Benchmarks were run on twelve cores."),
+            "page 2: {text:?}"
+        );
+        assert_eq!(page.meta.title.as_deref(), Some("Tokio Runtime Report"));
+        assert_eq!(page.meta.author.as_deref(), Some("Jane Doe"));
+        assert_eq!(page.meta.published.as_deref(), Some("2024-03-05"));
+        assert_eq!(page.meta.final_url, "https://a.com/report.pdf");
+
+        // A small budget stops after the first page.
+        let short = extract_pdf(&bytes, &url, 60).unwrap();
+        assert!(short.truncated);
+        assert!(!short.render(ContentFormat::Text, 60).0.contains("Benchmarks"));
+    }
+
+    #[test]
+    fn rejects_non_pdf_bytes() {
+        let url = Url::parse("https://a.com/x.pdf").unwrap();
+        assert!(extract_pdf(b"%PDF-1.4 garbage", &url, 100).is_err());
     }
 
     #[test]

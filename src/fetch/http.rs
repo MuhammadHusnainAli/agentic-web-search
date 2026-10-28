@@ -26,6 +26,51 @@ pub struct Fetched {
     pub content_type: Option<String>,
 }
 
+/// Hard cap on one content fetch; requests set tighter deadlines themselves.
+const CONTENT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Human-readable fetch error; reqwest reports a timeout mid-body as a
+/// "decoding" error, which hides what actually happened.
+fn describe(e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        "timed out downloading the page".into()
+    } else {
+        e.without_url().to_string()
+    }
+}
+
+/// A fetched result page, as raw bytes (it may be HTML, PDF, …).
+#[derive(Debug)]
+pub struct Document {
+    /// Final URL after redirects.
+    pub url: Url,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+    /// The body was longer than the size cap and got cut.
+    pub truncated: bool,
+}
+
+impl Document {
+    pub fn is_pdf(&self) -> bool {
+        self.bytes.starts_with(b"%PDF-")
+    }
+
+    /// The body as text; truncation may split a multi-byte char, so decode lossily.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+}
+
+/// Does the response announce a PDF (by type, or by a `.pdf` path when the type says nothing)?
+fn looks_like_pdf(content_type: Option<&str>, url: &Url) -> bool {
+    match content_type.map(str::to_ascii_lowercase) {
+        Some(ct) if ct.contains("pdf") => true,
+        None => url.path().to_ascii_lowercase().ends_with(".pdf"),
+        Some(ct) => ct.starts_with("application/octet-stream") && url.path().to_ascii_lowercase().ends_with(".pdf"),
+    }
+}
+
 pub struct HttpFetcher {
     /// SERP client: talks only to configured engine hosts.
     client: Client,
@@ -34,6 +79,7 @@ pub struct HttpFetcher {
     user_agents: Box<[HeaderValue]>,
     next_ua: AtomicUsize,
     max_body: usize,
+    max_pdf: usize,
     allow_private: bool,
 }
 
@@ -109,11 +155,11 @@ impl HttpFetcher {
         headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         headers.insert(header::UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
 
-        let builder = || {
+        let builder = |timeout: Duration| {
             let mut b = Client::builder()
                 .default_headers(headers.clone())
-                .timeout(cfg.upstream_timeout)
-                .connect_timeout(Duration::from_secs(5).min(cfg.upstream_timeout))
+                .timeout(timeout)
+                .connect_timeout(Duration::from_secs(5).min(timeout))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .pool_max_idle_per_host(64)
                 .tcp_nodelay(true)
@@ -125,10 +171,14 @@ impl HttpFetcher {
             Ok::<_, reqwest::Error>(b)
         };
 
-        let client = builder()?.redirect(redirect::Policy::limited(5)).build()?;
+        let client = builder(cfg.upstream_timeout)?
+            .redirect(redirect::Policy::limited(5))
+            .build()?;
 
         let allow_private = cfg.content_allow_private_ips;
-        let mut content = builder()?.redirect(redirect::Policy::custom(move |attempt| {
+        // Content fetches are bounded by each request's own content deadline
+        // (up to 30 s), not by the SERP timeout: big PDFs on slow hosts need it.
+        let mut content = builder(CONTENT_FETCH_TIMEOUT)?.redirect(redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
             } else if !allow_private && host_is_forbidden(attempt.url()) {
@@ -154,6 +204,7 @@ impl HttpFetcher {
             user_agents,
             next_ua: AtomicUsize::new(0),
             max_body: cfg.max_body_bytes,
+            max_pdf: cfg.content_max_pdf_bytes,
             allow_private,
         })
     }
@@ -189,7 +240,8 @@ impl HttpFetcher {
     }
 
     /// Fetch an arbitrary result page for content extraction (SSRF-guarded).
-    pub async fn fetch_document(&self, url: &str) -> Result<Fetched, String> {
+    /// PDFs get a larger size cap: they can't be parsed from a partial file.
+    pub async fn fetch_document(&self, url: &str) -> Result<Document, String> {
         let url = Url::parse(url).map_err(|e| e.to_string())?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err("unsupported scheme".into());
@@ -203,16 +255,49 @@ impl HttpFetcher {
             .header(header::USER_AGENT, self.user_agent())
             .send()
             .await
-            .map_err(|e| e.without_url().to_string())?;
-        read_capped(resp, self.max_body)
-            .await
-            .map_err(|e| e.without_url().to_string())
+            .map_err(describe)?;
+        let url = resp.url().clone();
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let cap = if looks_like_pdf(content_type.as_deref(), &url) {
+            self.max_pdf
+        } else {
+            self.max_body
+        };
+        let (bytes, truncated) = read_bytes(resp, cap).await.map_err(describe)?;
+        Ok(Document {
+            url,
+            status,
+            content_type,
+            bytes,
+            truncated,
+        })
     }
 }
 
-/// Stream the body into memory, stopping at `max` bytes so a huge or hostile
-/// response can never balloon memory.
-async fn read_capped(mut resp: Response, max: usize) -> Result<Fetched, reqwest::Error> {
+/// Stream the body into memory, stopping at `max` bytes. Returns the bytes and
+/// whether the body was longer.
+async fn read_bytes(mut resp: Response, max: usize) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let hint = resp.content_length().unwrap_or(64 * 1024) as usize;
+    let mut buf = Vec::with_capacity(hint.min(max));
+    while let Some(chunk) = resp.chunk().await? {
+        let room = max - buf.len();
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            return Ok((buf, true));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, false))
+}
+
+/// A capped SERP body, decoded as UTF-8 (lossily: the cap may split a char)
+/// so a huge or hostile response can never balloon memory.
+async fn read_capped(resp: Response, max: usize) -> Result<Fetched, reqwest::Error> {
     let url = resp.url().clone();
     let status = resp.status().as_u16();
     let content_type = resp
@@ -220,19 +305,9 @@ async fn read_capped(mut resp: Response, max: usize) -> Result<Fetched, reqwest:
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let hint = resp.content_length().unwrap_or(64 * 1024) as usize;
-    let mut buf = Vec::with_capacity(hint.min(max));
-    while let Some(chunk) = resp.chunk().await? {
-        let room = max - buf.len();
-        if chunk.len() >= room {
-            buf.extend_from_slice(&chunk[..room]);
-            break;
-        }
-        buf.extend_from_slice(&chunk);
-    }
+    let (buf, _) = read_bytes(resp, max).await?;
     let body = match String::from_utf8(buf) {
         Ok(s) => s,
-        // Truncation may split a multi-byte char; decode lossily instead of failing.
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
     Ok(Fetched {
@@ -280,5 +355,18 @@ mod tests {
             assert!(host_is_forbidden(&Url::parse(u).unwrap()), "{u}");
         }
         assert!(!host_is_forbidden(&Url::parse("https://rust-lang.org/").unwrap()));
+    }
+
+    #[test]
+    fn detects_announced_pdfs() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(looks_like_pdf(Some("application/pdf"), &u("https://a.com/x")));
+        assert!(looks_like_pdf(None, &u("https://a.com/paper.PDF")));
+        assert!(looks_like_pdf(
+            Some("application/octet-stream"),
+            &u("https://a.com/p.pdf")
+        ));
+        assert!(!looks_like_pdf(Some("text/html"), &u("https://a.com/p.pdf")));
+        assert!(!looks_like_pdf(None, &u("https://a.com/page")));
     }
 }
