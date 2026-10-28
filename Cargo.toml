@@ -1,0 +1,68 @@
+[package]
+name = "agentic-web-search"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Self-hosted, API-key protected web search microservice for AI agents. Multi-engine SERP scraping with HTTP fast path and headless Chromium fallback."
+license = "MIT"
+readme = "README.md"
+keywords = ["search", "agents", "scraping", "llm", "microservice"]
+categories = ["web-programming::http-server"]
+
+[lib]
+name = "agentic_web_search"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentic-web-search"
+path = "src/app/main.rs"
+
+[features]
+default = ["browser"]
+# Headless Chromium fallback for JS-only / bot-protected engines.
+# Build with `--no-default-features` for a tiny HTTP-only binary.
+browser = ["dep:chromiumoxide"]
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "query", "tokio", "tower-log", "tracing"] }
+base64 = "0.23.1"
+bytes = "1.12.1"
+chromiumoxide = { version = "0.9.1", optional = true }
+dotenvy = "0.15.7"
+ego-tree = "0.11"
+futures = "0.3.34"
+governor = "0.10.4"
+mimalloc = { version = "0.1.52", default-features = false }
+moka = { version = "0.12.16", features = ["future"] }
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "brotli", "deflate", "http2", "socks", "form", "query", "stream"] }
+scraper = "0.29.0"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tower = { version = "0.5.3", features = ["util", "limit", "load-shed"] }
+tower-http = { version = "0.7.1", features = ["trace", "compression-gzip", "compression-br", "cors", "timeout", "request-id", "util", "catch-panic"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+wiremock = "0.6.5"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep unwinding (not "abort") so CatchPanicLayer can turn a handler panic
+# into a 500 instead of killing the whole process.
+strip = "symbols"
+debug = false
+incremental = false
+
+# Fast-ish dev builds while keeping heavy deps optimized (HTML parsing in tests).
+[profile.dev.package."*"]
+opt-level = 2

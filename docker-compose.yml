@@ -1,0 +1,26 @@
+services:
+  agentic-web-search:
+    build:
+      context: .
+      target: full          # or `lite` for the HTTP-only image
+    image: agentic-web-search:latest
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      LOG_FORMAT: json
+    # Chromium needs more than Docker's 64 MB default /dev/shm.
+    shm_size: "512m"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/app
+    security_opt:
+      - no-new-privileges:true
